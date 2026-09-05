@@ -495,17 +495,26 @@ function App() {
 
   async function handleImportRazorpayDispute(event) {
     event.preventDefault();
-    if (!analysis?.dispute_id || !razorpayDisputeId.trim()) return;
+    const externalDisputeId = razorpayDisputeId.trim();
+    if (!externalDisputeId) {
+      setNotice("Enter a Razorpay dispute ID.");
+      return;
+    }
+    if (!/^disp_[A-Za-z0-9]+$/.test(externalDisputeId) || externalDisputeId.startsWith("disp_test_")) {
+      setNotice("Enter a valid Razorpay dispute ID beginning with disp_.");
+      return;
+    }
+    if (!analysis?.dispute_id) return;
     setNotice("");
     setBusy("import-razorpay-dispute");
     try {
       const payload = await fetchRazorpayDispute({
         workflowId: analysis.dispute_id,
-        razorpayDisputeId: razorpayDisputeId.trim(),
+        razorpayDisputeId: externalDisputeId,
       });
       setHandoff(payload);
     } catch (error) {
-      setNotice(`Unable to import the Razorpay dispute: ${error.message}`);
+      setNotice("Could not import this Razorpay dispute. Check the dispute ID and your Test Mode account.");
     } finally {
       setBusy("");
     }
@@ -536,6 +545,9 @@ function App() {
 
   const requiredEvidence = analysis?.evidence_required || [];
   const availableEvidence = new Set(analysis?.evidence_available || []);
+  const hasConfirmedRazorpayDispute = handoff?.razorpay_mode === "connected"
+    && handoff?.razorpay_dispute_imported === true
+    && typeof handoff?.razorpay_dispute_id === "string";
   const criticalEvidence = new Set(analysis?.critical_evidence || []);
 
   return (
@@ -943,10 +955,15 @@ function App() {
 
             {handoff?.razorpay_mode === "connected" && (
               <form className="handoff-import" onSubmit={handleImportRazorpayDispute}>
-                <Field label="Razorpay dispute ID" helper="Optional for manual/demo cases. A connected draft requires an imported Razorpay dispute ID.">
+                <Field label="Razorpay Dispute" helper="A real Razorpay dispute ID is required to prepare a contest draft.">
+                  {hasConfirmedRazorpayDispute ? (
+                    <strong className="imported-dispute">✓ {handoff.razorpay_dispute_id} imported</strong>
+                  ) : (
+                    <p className="empty-state">No Razorpay dispute is linked to this case.</p>
+                  )}
                   <input value={razorpayDisputeId} onChange={(event) => setRazorpayDisputeId(event.target.value)} placeholder="disp_..." />
                 </Field>
-                <button className="secondary" type="submit" disabled={busy === "import-razorpay-dispute"}>
+                <button className="secondary" type="submit" disabled={busy === "import-razorpay-dispute" || !razorpayDisputeId.trim()}>
                   {busy === "import-razorpay-dispute" ? "Importing…" : "Import Razorpay Dispute"}
                 </button>
               </form>
@@ -955,9 +972,13 @@ function App() {
             {handoff?.razorpay_mode === "connected" && (
               <section className="contest-draft-panel" aria-label="Contest Draft status">
                 <h3>Contest Draft</h3>
-                {handoff.razorpay_dispute_id ? (
+                {hasConfirmedRazorpayDispute && handoff.razorpay_draft_status === "prepared" ? (
                   <>
-                    <p>A Razorpay dispute has been imported. You may prepare a draft for merchant review; this does not submit the dispute.</p>
+                    <p className="sync-success">✓ Razorpay contest draft prepared for merchant review.</p>
+                  </>
+                ) : hasConfirmedRazorpayDispute ? (
+                  <>
+                    <p>Ready to prepare. This creates a draft for merchant review and does not submit the dispute.</p>
                     <button className="primary" type="button" disabled={busy === "prepare-handoff"} onClick={handlePrepareRazorpayDraft}>
                       {busy === "prepare-handoff" ? "Preparing…" : "Prepare Razorpay Draft"}
                     </button>
@@ -966,6 +987,7 @@ function App() {
                   <>
                     <strong>Waiting for Razorpay dispute ID</strong>
                     <p>Your verified evidence has been uploaded to Razorpay. A Razorpay dispute ID is required before RebuttalAI can prepare a contest draft.</p>
+                    <button className="primary" type="button" disabled>Prepare Razorpay Draft</button>
                   </>
                 )}
               </section>

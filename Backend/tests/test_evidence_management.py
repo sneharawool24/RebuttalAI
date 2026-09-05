@@ -535,7 +535,11 @@ class EvidenceManagementApiTests(unittest.TestCase):
         workflow = self.create_workflow()
         self.upload_and_verify(workflow["dispute_id"])
         evidence_store.update_razorpay_handoff(
-            workflow["dispute_id"], {"razorpay_dispute_id": "disp_AbCdEf12345678"}
+            workflow["dispute_id"],
+            {
+                "razorpay_dispute_id": "disp_AbCdEf12345678",
+                "razorpay_dispute_imported": True,
+            },
         )
 
         fake_provider = SimpleNamespace(
@@ -572,7 +576,11 @@ class EvidenceManagementApiTests(unittest.TestCase):
         verified = self.upload_and_verify(workflow["dispute_id"])
         self.upload_pdf(workflow["dispute_id"], "UPI authentication/authorization records")
         evidence_store.update_razorpay_handoff(
-            workflow["dispute_id"], {"razorpay_dispute_id": "disp_AbCdEf12345678"}
+            workflow["dispute_id"],
+            {
+                "razorpay_dispute_id": "disp_AbCdEf12345678",
+                "razorpay_dispute_imported": True,
+            },
         )
 
         class FakeProvider:
@@ -629,12 +637,28 @@ class EvidenceManagementApiTests(unittest.TestCase):
             "RAZORPAY_KEY_ID": "key_test",
             "RAZORPAY_KEY_SECRET": "secret_test",
         }
-        with patch.dict(os.environ, environment, clear=False):
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient"
+        ) as client_factory:
             invalid = self.client.post(
                 "/razorpay/dispute/fetch",
                 json={"workflow_id": workflow["dispute_id"], "razorpay_dispute_id": "bad"},
             )
         self.assertEqual(invalid.status_code, 422)
+        client_factory.assert_not_called()
+
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient"
+        ) as client_factory:
+            local_fixture = self.client.post(
+                "/razorpay/dispute/fetch",
+                json={
+                    "workflow_id": workflow["dispute_id"],
+                    "razorpay_dispute_id": "disp_test_rebuttalai_001",
+                },
+            )
+        self.assertEqual(local_fixture.status_code, 422)
+        client_factory.assert_not_called()
 
         fake_provider = SimpleNamespace(
             fetch_dispute=lambda *_: (_ for _ in ()).throw(
@@ -653,6 +677,9 @@ class EvidenceManagementApiTests(unittest.TestCase):
             )
         self.assertEqual(failed.status_code, 502)
         self.assertNotIn("key_test", failed.json()["detail"])
+        handoff = self.client.get(f"/razorpay/{workflow['dispute_id']}/handoff").json()
+        self.assertIsNone(handoff["razorpay_dispute_id"])
+        self.assertFalse(handoff["razorpay_dispute_imported"])
 
     def test_connected_fetch_stores_limited_provider_metadata(self):
         workflow = self.create_workflow()
@@ -684,10 +711,37 @@ class EvidenceManagementApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["razorpay_dispute_imported"])
         metadata = response.json()["razorpay_dispute_metadata"]
         self.assertEqual(metadata["id"], "disp_AbCdEf12345678")
         self.assertNotIn("evidence", metadata)
         self.assertNotIn("private_provider_field", metadata)
+
+    def test_connected_draft_requires_a_provider_confirmed_dispute_import(self):
+        workflow = self.create_workflow()
+        self.upload_and_verify(workflow["dispute_id"])
+        # A webhook or stale local value may carry an ID. It is not an import.
+        evidence_store.update_razorpay_handoff(
+            workflow["dispute_id"],
+            {"razorpay_dispute_id": "disp_AbCdEf12345678"},
+        )
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient"
+        ) as client_factory:
+            response = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/prepare-draft"
+            )
+
+        self.assertEqual(response.status_code, 400)
+        client_factory.assert_called_once()
+        handoff = self.client.get(f"/razorpay/{workflow['dispute_id']}/handoff").json()
+        self.assertFalse(handoff["razorpay_dispute_imported"])
+        self.assertEqual(handoff["razorpay_draft_status"], "not_prepared")
 
     def test_sync_evidence_connected_needs_no_razorpay_dispute_id(self):
         workflow = self.create_workflow()

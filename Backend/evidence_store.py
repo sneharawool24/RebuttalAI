@@ -91,6 +91,7 @@ def create_dispute_snapshot(snapshot: dict[str, Any]) -> str:
         "prediction_snapshot": snapshot,
         "razorpay_handoff": {
             "razorpay_dispute_id": None,
+            "razorpay_dispute_imported": False,
             "razorpay_dispute_metadata": None,
             "handoff_status": "not_prepared",
             "contest_summary": None,
@@ -107,6 +108,9 @@ def create_dispute_snapshot(snapshot: dict[str, Any]) -> str:
 def _new_handoff_state(razorpay_dispute_id: str | None = None) -> dict[str, Any]:
     return {
         "razorpay_dispute_id": razorpay_dispute_id,
+        # A webhook can provide a dispute ID, but connected-mode draft
+        # preparation requires a separate, successful provider import.
+        "razorpay_dispute_imported": False,
         "razorpay_dispute_metadata": None,
         "handoff_status": "not_prepared",
         "contest_summary": None,
@@ -143,9 +147,11 @@ def create_or_update_webhook_workflow(
         workflow = index["disputes"][workflow_id]
         workflow["webhook_metadata"] = webhook_metadata
         workflow["updated_at"] = _timestamp()
-        workflow.setdefault("razorpay_handoff", _new_handoff_state())[
-            "razorpay_dispute_id"
-        ] = razorpay_dispute_id
+        handoff = workflow.setdefault("razorpay_handoff", _new_handoff_state())
+        handoff["razorpay_dispute_id"] = razorpay_dispute_id
+        # Preserve an earlier confirmed import, but never treat webhook
+        # receipt alone as a connected-provider confirmation.
+        handoff.setdefault("razorpay_dispute_imported", False)
         outcome = "updated"
     else:
         workflow_id = str(uuid4())

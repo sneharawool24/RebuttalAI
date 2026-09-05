@@ -1481,6 +1481,7 @@ def handoff_view(workflow_id: str) -> dict:
         "workflow_id": workflow_id,
         "razorpay_mode": mode,
         "razorpay_dispute_id": stored.get("razorpay_dispute_id"),
+        "razorpay_dispute_imported": bool(stored.get("razorpay_dispute_imported")),
         "razorpay_dispute_metadata": stored.get("razorpay_dispute_metadata"),
         "handoff_status": stored.get("handoff_status", "not_prepared"),
         "contest_summary": stored.get("contest_summary"),
@@ -1672,8 +1673,10 @@ def prepare_connected_handoff(workflow_id: str) -> dict:
     provider = connected_razorpay_client()
     stored_handoff = dispute.get("razorpay_handoff", {})
     razorpay_dispute_id = stored_handoff.get("razorpay_dispute_id")
-    if not isinstance(razorpay_dispute_id, str) or not RAZORPAY_DISPUTE_ID_PATTERN.fullmatch(
-        razorpay_dispute_id
+    if (
+        not stored_handoff.get("razorpay_dispute_imported")
+        or not isinstance(razorpay_dispute_id, str)
+        or not RAZORPAY_DISPUTE_ID_PATTERN.fullmatch(razorpay_dispute_id)
     ):
         raise HTTPException(
             status_code=400,
@@ -1947,6 +1950,7 @@ def fetch_razorpay_dispute(data: RazorpayDisputeFetchInput):
             {
                 "razorpay_mode": "connected",
                 "razorpay_dispute_id": external_id,
+                "razorpay_dispute_imported": True,
                 "razorpay_dispute_metadata": safe_razorpay_dispute_metadata(
                     provider_dispute
                 ),
