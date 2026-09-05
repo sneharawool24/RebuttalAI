@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 import os
 import tempfile
 import unittest
@@ -62,6 +65,64 @@ class EvidenceManagementApiTests(unittest.TestCase):
         payload = response.json()
         self.assertIn("dispute_id", payload)
         return payload
+
+    @staticmethod
+    def webhook_payload(
+        dispute_id="disp_test_webhook_001",
+        reason="unauthorized_transaction",
+        reason_code="transaction_not_recognized",
+        method="upi",
+        simulated=False,
+    ):
+        payload = {
+            "entity": "event",
+            "event": "payment.dispute.created",
+            "payload": {
+                "payment": {
+                    "entity": {
+                        "id": "pay_test_webhook_001",
+                        "amount": 429900,
+                        "currency": "INR",
+                        "order_id": "order_test_webhook_001",
+                        "method": method,
+                    }
+                },
+                "dispute": {
+                    "entity": {
+                        "id": dispute_id,
+                        "payment_id": "pay_test_webhook_001",
+                        "amount": 429900,
+                        "currency": "INR",
+                        "reason": reason,
+                        "reason_code": reason_code,
+                        "status": "open",
+                        "phase": "chargeback",
+                        "created_at": 1735689700,
+                    }
+                },
+            },
+            "created_at": 1735689700,
+        }
+        if simulated:
+            payload["rebuttalai_simulated_webhook"] = True
+        return payload
+
+    def send_signed_webhook(self, payload, event_id="evt_test_webhook_001"):
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        secret = "webhook_test_secret"
+        signature = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        with patch.dict(
+            os.environ, {"RAZORPAY_WEBHOOK_SECRET": secret}, clear=False
+        ):
+            return self.client.post(
+                "/webhooks/razorpay",
+                content=raw_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": signature,
+                    "x-razorpay-event-id": event_id,
+                },
+            )
 
     def upload_pdf(self, dispute_id, category="UPI transaction details"):
         return self.client.post(
@@ -627,3 +688,329 @@ class EvidenceManagementApiTests(unittest.TestCase):
         self.assertEqual(metadata["id"], "disp_AbCdEf12345678")
         self.assertNotIn("evidence", metadata)
         self.assertNotIn("private_provider_field", metadata)
+
+    def test_sync_evidence_connected_needs_no_razorpay_dispute_id(self):
+        workflow = self.create_workflow()
+        verified = self.upload_and_verify(workflow["dispute_id"])
+        pending = self.upload_pdf(
+            workflow["dispute_id"], "UPI authentication/authorization records"
+        )
+        self.assertEqual(pending.status_code, 201)
+
+        class FakeProvider:
+            def __init__(self):
+                self.uploads = []
+
+            def upload_document(self, _path, filename, content_type):
+                self.uploads.append((filename, content_type))
+                return "doc_RealTestDocument123"
+
+        fake_provider = FakeProvider()
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient", return_value=fake_provider
+        ):
+            response = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/sync-evidence"
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["razorpay_mode"], "connected")
+        self.assertEqual(payload["evidence_sync_status"], "synced")
+        self.assertEqual(payload["results"][0]["status"], "synced")
+        self.assertEqual(
+            payload["results"][0]["razorpay_document_id"], "doc_RealTestDocument123"
+        )
+        self.assertEqual(fake_provider.uploads, [("merchant-record.pdf", "application/pdf")])
+        self.assertIsNone(payload["handoff"]["razorpay_dispute_id"])
+        self.assertEqual(payload["handoff"]["prepared_evidence_count"], 1)
+        self.assertEqual(payload["handoff"]["waiting_evidence_count"], 0)
+        stored = self.client.get(f"/evidence/{workflow['dispute_id']}").json()["evidence"]
+        self.assertEqual(stored[0]["evidence_id"], verified["evidence_id"])
+        self.assertEqual(stored[0]["razorpay_sync_status"], "synced")
+        self.assertEqual(stored[0]["razorpay_document_id"], "doc_RealTestDocument123")
+
+    def test_sync_evidence_skips_already_synced_files(self):
+        workflow = self.create_workflow()
+        self.upload_and_verify(workflow["dispute_id"])
+
+        class FakeProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def upload_document(self, *_):
+                self.calls += 1
+                return "doc_SyncOnly123"
+
+        fake_provider = FakeProvider()
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient", return_value=fake_provider
+        ):
+            first = self.client.post(f"/razorpay/{workflow['dispute_id']}/sync-evidence")
+            second = self.client.post(f"/razorpay/{workflow['dispute_id']}/sync-evidence")
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(fake_provider.calls, 1)
+        self.assertEqual(second.json()["results"][0]["status"], "already_synced")
+
+    def test_sync_evidence_partial_failure_keeps_successful_document_id(self):
+        workflow = self.create_workflow()
+        first = self.upload_and_verify(workflow["dispute_id"])
+        second = self.upload_and_verify(
+            workflow["dispute_id"], "UPI authentication/authorization records"
+        )
+
+        class FakeProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def upload_document(self, *_):
+                self.calls += 1
+                if self.calls == 1:
+                    return "doc_FirstSuccess123"
+                raise razorpay_handoff.RazorpayAdapterError("Safe provider failure.")
+
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient", return_value=FakeProvider()
+        ):
+            response = self.client.post(f"/razorpay/{workflow['dispute_id']}/sync-evidence")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["evidence_sync_status"], "partial_failed")
+        self.assertEqual(payload["results"][0]["status"], "synced")
+        self.assertEqual(payload["results"][1]["status"], "failed")
+        self.assertNotIn("doc_", payload["results"][1].get("error", ""))
+        stored = {
+            item["evidence_id"]: item
+            for item in self.client.get(f"/evidence/{workflow['dispute_id']}").json()["evidence"]
+        }
+        self.assertEqual(
+            stored[first["evidence_id"]]["razorpay_document_id"], "doc_FirstSuccess123"
+        )
+        self.assertEqual(stored[second["evidence_id"]]["razorpay_sync_status"], "failed")
+        self.assertIsNone(stored[second["evidence_id"]]["razorpay_document_id"])
+
+    def test_sync_evidence_connected_missing_credentials_fails_safely(self):
+        workflow = self.create_workflow()
+        self.upload_and_verify(workflow["dispute_id"])
+        with patch.dict(
+            os.environ,
+            {
+                "RAZORPAY_MODE": "connected",
+                "RAZORPAY_KEY_ID": "",
+                "RAZORPAY_KEY_SECRET": "",
+            },
+            clear=False,
+        ):
+            response = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/sync-evidence"
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("backend credentials", response.json()["detail"])
+
+    def test_sync_evidence_demo_makes_zero_provider_calls(self):
+        workflow = self.create_workflow()
+        self.upload_and_verify(workflow["dispute_id"])
+        with patch.dict(os.environ, {"RAZORPAY_MODE": "demo"}, clear=False), patch.object(
+            main, "RazorpayClient"
+        ) as provider_client:
+            response = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/sync-evidence"
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        provider_client.assert_not_called()
+        self.assertEqual(payload["evidence_sync_status"], "simulated_demo")
+        self.assertTrue(payload["results"][0]["demo_document_reference"].startswith("demo_doc_"))
+        self.assertIsNone(payload["results"][0]["razorpay_document_id"])
+        self.assertIn("No data was sent to Razorpay", payload["message"])
+
+    def test_document_adapter_uses_dispute_evidence_purpose(self):
+        source_file = Path(self.temp_directory.name) / "document.jpg"
+        source_file.write_bytes(b"image bytes")
+        adapter = razorpay_handoff.RazorpayClient("key_test", "secret_test")
+        captured = {}
+
+        def capture_request(method, path, body=None, content_type=None):
+            captured.update(
+                method=method,
+                path=path,
+                body=body,
+                content_type=content_type,
+            )
+            return {"id": "doc_AdapterTest123"}
+
+        with patch.object(adapter, "_request_json", side_effect=capture_request):
+            document_id = adapter.upload_document(
+                source_file, "merchant-photo.jpg", "image/jpeg"
+            )
+
+        self.assertEqual(document_id, "doc_AdapterTest123")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/documents")
+        self.assertIn("multipart/form-data", captured["content_type"])
+        self.assertIn(
+            b'Content-Disposition: form-data; name="purpose"\r\n\r\ndispute_evidence',
+            captured["body"],
+        )
+
+    def test_valid_signed_webhook_creates_safe_preanalysis_workflow(self):
+        response = self.send_signed_webhook(self.webhook_payload())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "created")
+        workflow_id = response.json()["workflow_id"]
+
+        incoming = self.client.get("/razorpay/incoming-disputes")
+        self.assertEqual(incoming.status_code, 200, incoming.text)
+        dispute = incoming.json()["disputes"][0]
+        self.assertEqual(dispute["workflow_id"], workflow_id)
+        self.assertEqual(dispute["razorpay_dispute_id"], "disp_test_webhook_001")
+        self.assertEqual(dispute["internal_dispute_type"], "upi_unauthorized")
+        self.assertTrue(dispute["additional_merchant_input_required"])
+        self.assertEqual(dispute["form_prefill"]["order_value"], 4299.0)
+        self.assertEqual(dispute["form_prefill"]["dispute_type"], "upi_unauthorized")
+
+        stored = evidence_store.get_webhook_workflow(workflow_id)
+        self.assertIsNone(stored["prediction_snapshot"])
+        self.assertFalse(stored["analysis_ready"])
+        self.assertEqual(
+            stored["razorpay_handoff"]["razorpay_dispute_id"],
+            "disp_test_webhook_001",
+        )
+
+    def test_invalid_or_missing_webhook_signature_creates_no_workflow(self):
+        payload = self.webhook_payload()
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        with patch.dict(
+            os.environ, {"RAZORPAY_WEBHOOK_SECRET": "webhook_test_secret"}, clear=False
+        ):
+            missing = self.client.post("/webhooks/razorpay", content=raw_body)
+            invalid = self.client.post(
+                "/webhooks/razorpay",
+                content=raw_body,
+                headers={"X-Razorpay-Signature": "not-a-valid-signature"},
+            )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(invalid.status_code, 401)
+        self.assertEqual(self.client.get("/razorpay/incoming-disputes").json()["disputes"], [])
+
+    def test_webhook_missing_secret_and_raw_body_mismatch_fail_safely(self):
+        payload = self.webhook_payload()
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        signature = hmac.new(
+            b"webhook_test_secret", raw_body, hashlib.sha256
+        ).hexdigest()
+        with patch.dict(os.environ, {"RAZORPAY_WEBHOOK_SECRET": ""}, clear=False):
+            missing_secret = self.client.post(
+                "/webhooks/razorpay",
+                content=raw_body,
+                headers={"X-Razorpay-Signature": signature},
+            )
+        with patch.dict(
+            os.environ, {"RAZORPAY_WEBHOOK_SECRET": "webhook_test_secret"}, clear=False
+        ):
+            altered_body = self.client.post(
+                "/webhooks/razorpay",
+                content=raw_body + b" ",
+                headers={"X-Razorpay-Signature": signature},
+            )
+
+        self.assertEqual(missing_secret.status_code, 503)
+        self.assertEqual(altered_body.status_code, 401)
+        self.assertEqual(self.client.get("/razorpay/incoming-disputes").json()["disputes"], [])
+
+    def test_duplicate_event_and_dispute_id_reuse_existing_webhook_workflow(self):
+        payload = self.webhook_payload()
+        first = self.send_signed_webhook(payload, event_id="evt_duplicate_001")
+        duplicate_event = self.send_signed_webhook(payload, event_id="evt_duplicate_001")
+        same_dispute_new_event = self.send_signed_webhook(
+            payload, event_id="evt_duplicate_002"
+        )
+
+        self.assertEqual(first.json()["status"], "created")
+        self.assertEqual(duplicate_event.json()["status"], "duplicate_ignored")
+        self.assertEqual(same_dispute_new_event.json()["status"], "updated")
+        self.assertEqual(
+            first.json()["workflow_id"], same_dispute_new_event.json()["workflow_id"]
+        )
+        self.assertEqual(len(self.client.get("/razorpay/incoming-disputes").json()["disputes"]), 1)
+
+    def test_signed_unsupported_and_incomplete_webhooks_are_safely_ignored(self):
+        unsupported = self.webhook_payload()
+        unsupported["event"] = "payment.dispute.won"
+        ignored = self.send_signed_webhook(unsupported, event_id="evt_ignored_001")
+
+        incomplete = {
+            "entity": "event",
+            "event": "payment.dispute.created",
+            "payload": {"dispute": {"entity": {"id": "disp_test_incomplete_001"}}},
+        }
+        accepted_incomplete = self.send_signed_webhook(incomplete, event_id="evt_ignored_002")
+
+        self.assertEqual(ignored.status_code, 200)
+        self.assertEqual(ignored.json()["status"], "ignored")
+        self.assertEqual(accepted_incomplete.status_code, 200)
+        self.assertEqual(accepted_incomplete.json()["status"], "created")
+        incoming = self.client.get("/razorpay/incoming-disputes").json()["disputes"]
+        self.assertEqual(len(incoming), 1)
+        self.assertIsNone(incoming[0]["internal_dispute_type"])
+        self.assertTrue(incoming[0]["additional_merchant_input_required"])
+
+    def test_unknown_reason_is_not_force_mapped_and_test_source_is_labelled(self):
+        response = self.send_signed_webhook(
+            self.webhook_payload(
+                dispute_id="disp_test_unknown_001",
+                reason="excessive_fee",
+                reason_code="processing_charge",
+                method="upi",
+                simulated=True,
+            ),
+            event_id="evt_test_source_001",
+        )
+        workflow_id = response.json()["workflow_id"]
+        incoming = self.client.get(
+            f"/razorpay/incoming-disputes/{workflow_id}"
+        )
+        self.assertEqual(incoming.status_code, 200, incoming.text)
+        self.assertIsNone(incoming.json()["internal_dispute_type"])
+        self.assertEqual(incoming.json()["source_label"], "Razorpay Webhook Test")
+        self.assertTrue(incoming.json()["is_simulated"])
+
+    def test_webhook_case_uses_the_existing_prediction_workflow_after_input(self):
+        webhook = self.send_signed_webhook(
+            self.webhook_payload(dispute_id="disp_test_converge_001"),
+            event_id="evt_converge_001",
+        )
+        workflow_id = webhook.json()["workflow_id"]
+        prediction = self.prediction_payload(start_evidence_workflow=True)
+        prediction["existing_workflow_id"] = workflow_id
+        response = self.client.post("/predict", json=prediction)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["dispute_id"], workflow_id)
+        stored = evidence_store.get_webhook_workflow(workflow_id)
+        self.assertTrue(stored["analysis_ready"])
+        self.assertIsNotNone(stored["prediction_snapshot"])
+        self.assertEqual(
+            stored["razorpay_handoff"]["razorpay_dispute_id"],
+            "disp_test_converge_001",
+        )

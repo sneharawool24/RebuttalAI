@@ -1,9 +1,10 @@
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 import joblib
+import json
 import os
 import pandas as pd
 import re
@@ -14,11 +15,15 @@ try:
     from .evidence_store import (
         EvidenceStoreError,
         add_evidence,
+        attach_prediction_snapshot_to_webhook_workflow,
         create_dispute_snapshot,
+        create_or_update_webhook_workflow,
         delete_evidence,
         get_evidence_file,
+        get_webhook_workflow,
         get_dispute_snapshot,
         list_evidence,
+        list_webhook_workflows,
         mark_rebuttal_ready,
         public_metadata,
         update_evidence_razorpay_sync,
@@ -33,15 +38,25 @@ try:
         demo_document_reference,
         evidence_mapping,
     )
+    from .razorpay_webhooks import (
+        ACTIVE_DISPUTE_EVENT,
+        extract_dispute_metadata,
+        public_incoming_dispute,
+        signature_is_valid,
+    )
 except ImportError:
     from evidence_store import (
         EvidenceStoreError,
         add_evidence,
+        attach_prediction_snapshot_to_webhook_workflow,
         create_dispute_snapshot,
+        create_or_update_webhook_workflow,
         delete_evidence,
         get_evidence_file,
+        get_webhook_workflow,
         get_dispute_snapshot,
         list_evidence,
+        list_webhook_workflows,
         mark_rebuttal_ready,
         public_metadata,
         update_evidence_razorpay_sync,
@@ -55,6 +70,12 @@ except ImportError:
         demo_dispute_reference,
         demo_document_reference,
         evidence_mapping,
+    )
+    from razorpay_webhooks import (
+        ACTIVE_DISPUTE_EVENT,
+        extract_dispute_metadata,
+        public_incoming_dispute,
+        signature_is_valid,
     )
 
 
@@ -180,6 +201,10 @@ class DisputeInput(BaseModel):
     # Omitted by legacy callers, preserving their existing contract.
     start_evidence_workflow: bool = False
 
+    # Used only when a merchant opens a pre-analysis Razorpay webhook case.
+    # It lets the existing prediction result attach to that same workflow.
+    existing_workflow_id: str | None = None
+
 
 # ============================================================
 # INPUT SCHEMA - REBUTTAL GENERATION
@@ -259,6 +284,86 @@ def home():
     return {
         "message": "RebuttalAI API is running!"
     }
+
+
+# ============================================================
+# RAZORPAY WEBHOOKS
+# ============================================================
+
+
+@app.post("/webhooks/razorpay")
+async def receive_razorpay_webhook(request: Request):
+    """Verify Razorpay's raw-body signature before trusting webhook JSON."""
+
+    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+    if not webhook_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay webhook verification is not configured.",
+        )
+
+    raw_body = await request.body()
+    signature = request.headers.get("x-razorpay-signature")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Razorpay webhook signature is required.")
+    if not signature_is_valid(raw_body, signature, webhook_secret):
+        raise HTTPException(status_code=401, detail="Razorpay webhook signature is invalid.")
+
+    try:
+        event_payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="Razorpay webhook payload is invalid.")
+    if not isinstance(event_payload, dict):
+        raise HTTPException(status_code=400, detail="Razorpay webhook payload is invalid.")
+
+    event_name = event_payload.get("event")
+    if event_name != ACTIVE_DISPUTE_EVENT:
+        return {"status": "ignored", "event": event_name or "unknown"}
+
+    metadata = extract_dispute_metadata(event_payload)
+    if not metadata:
+        return {
+            "status": "ignored",
+            "event": event_name,
+            "reason": "missing_dispute_metadata",
+        }
+
+    event_id = request.headers.get("x-razorpay-event-id")
+    try:
+        workflow_id, status = create_or_update_webhook_workflow(event_id, metadata)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    return {
+        "status": status,
+        "event": event_name,
+        "workflow_id": workflow_id,
+    }
+
+
+@app.get("/razorpay/incoming-disputes")
+def list_incoming_razorpay_disputes():
+    """List only normalized, non-sensitive webhook-created cases."""
+
+    try:
+        return {
+            "disputes": [
+                public_incoming_dispute(workflow)
+                for workflow in list_webhook_workflows()
+            ]
+        }
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+
+@app.get("/razorpay/incoming-disputes/{workflow_id}")
+def get_incoming_razorpay_dispute(workflow_id: str):
+    """Load one safe pre-analysis webhook case into the existing form."""
+
+    try:
+        return public_incoming_dispute(get_webhook_workflow(workflow_id))
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
 
 
 # ============================================================
@@ -700,7 +805,13 @@ def predict_dispute(data: DisputeInput):
             "critical_evidence": critical_evidence,
         }
         try:
-            result["dispute_id"] = create_dispute_snapshot(snapshot)
+            if data.existing_workflow_id:
+                attach_prediction_snapshot_to_webhook_workflow(
+                    data.existing_workflow_id, snapshot
+                )
+                result["dispute_id"] = data.existing_workflow_id
+            else:
+                result["dispute_id"] = create_dispute_snapshot(snapshot)
         except EvidenceStoreError as error:
             raise evidence_error_to_http(error)
 
@@ -1324,7 +1435,10 @@ def handoff_view(workflow_id: str) -> dict:
     state = workflow_state(workflow_id)
     mode = razorpay_mode()
     stored = dispute.get("razorpay_handoff", {})
-    prepared_demo = stored.get("handoff_status") == "prepared_demo"
+    demo_evidence_prepared = (
+        stored.get("handoff_status") == "prepared_demo"
+        or stored.get("evidence_sync_status") == "simulated_demo"
+    )
     evidence_items = []
 
     for evidence in list_evidence(workflow_id):
@@ -1341,18 +1455,27 @@ def handoff_view(workflow_id: str) -> dict:
             ),
             "razorpay_document_id": evidence.get("razorpay_document_id"),
         }
-        if prepared_demo:
+        if demo_evidence_prepared:
             item["preparation_status"] = "Prepared for demo"
             item["demo_document_reference"] = demo_document_reference(
                 evidence["evidence_id"]
             )
         elif item["razorpay_sync_status"] == "synced":
-            item["preparation_status"] = "Synced"
+            item["preparation_status"] = "Synced to Razorpay"
         elif item["razorpay_sync_status"] == "failed":
             item["preparation_status"] = "Sync failed"
         else:
-            item["preparation_status"] = "Not synced"
+            item["preparation_status"] = "Waiting to sync"
         evidence_items.append(item)
+
+    prepared_evidence_count = (
+        len(evidence_items)
+        if demo_evidence_prepared
+        else sum(
+            item["razorpay_sync_status"] == "synced"
+            for item in evidence_items
+        )
+    )
 
     return {
         "workflow_id": workflow_id,
@@ -1365,17 +1488,12 @@ def handoff_view(workflow_id: str) -> dict:
         "razorpay_draft_status": stored.get("razorpay_draft_status", "not_prepared"),
         "rebuttal_ready": bool(stored.get("rebuttal_ready")),
         "verified_evidence_count": len(evidence_items),
-        "prepared_evidence_count": (
-            len(evidence_items)
-            if prepared_demo
-            else sum(
-                item["razorpay_sync_status"] == "synced"
-                for item in evidence_items
-            )
-        ),
+        "prepared_evidence_count": prepared_evidence_count,
+        "waiting_evidence_count": len(evidence_items) - prepared_evidence_count,
         "critical_evidence_missing": state["critical_evidence_missing"],
         "submission_status": "not_submitted",
         "demo_dispute_reference": stored.get("demo_dispute_reference"),
+        "evidence_sync_status": stored.get("evidence_sync_status", "not_synced"),
         "evidence": evidence_items,
     }
 
@@ -1408,9 +1526,143 @@ def prepare_demo_handoff(workflow_id: str) -> dict:
             "prepared_at": handoff_timestamp(),
             "razorpay_draft_status": "prepared",
             "demo_dispute_reference": demo_dispute_reference(workflow_id),
+            "evidence_sync_status": "simulated_demo",
         },
     )
     return handoff_view(workflow_id)
+
+
+def evidence_sync_result(evidence: dict, status: str, error: str | None = None) -> dict:
+    """Return one safe, frontend-ready document sync outcome."""
+
+    result = {
+        "evidence_id": evidence["evidence_id"],
+        "evidence_category": evidence["evidence_category"],
+        "original_filename": evidence["original_filename"],
+        "status": status,
+        "razorpay_document_id": evidence.get("razorpay_document_id"),
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
+def persist_connected_sync_status(workflow_id: str, results: list[dict]) -> None:
+    """Record aggregate sync state without changing draft/submission state."""
+
+    statuses = {result["status"] for result in results}
+    if not results:
+        aggregate_status = "not_synced"
+    elif "failed" in statuses and statuses <= {"failed"}:
+        aggregate_status = "failed"
+    elif "failed" in statuses:
+        aggregate_status = "partial_failed"
+    else:
+        aggregate_status = "synced"
+
+    update_razorpay_handoff(
+        workflow_id,
+        {
+            "razorpay_mode": "connected",
+            "evidence_sync_status": aggregate_status,
+            "evidence_synced_at": handoff_timestamp(),
+        },
+    )
+
+
+def sync_connected_evidence(
+    workflow_id: str,
+    provider: RazorpayClient | None = None,
+) -> dict:
+    """Upload only verified, previously-unsynced files; no external dispute ID."""
+
+    get_dispute_snapshot(workflow_id)
+    provider = provider or connected_razorpay_client()
+    results = []
+
+    for evidence in verified_evidence_for_handoff(workflow_id):
+        document_id = evidence.get("razorpay_document_id")
+        if evidence.get("razorpay_sync_status") == "synced" and isinstance(
+            document_id, str
+        ) and document_id.startswith("doc_"):
+            results.append(evidence_sync_result(evidence, "already_synced"))
+            continue
+
+        try:
+            _, file_path = get_evidence_file(workflow_id, evidence["evidence_id"])
+            document_id = provider.upload_document(
+                file_path,
+                evidence["original_filename"],
+                evidence["content_type"],
+            )
+            evidence = update_evidence_razorpay_sync(
+                workflow_id,
+                evidence["evidence_id"],
+                "synced",
+                document_id,
+            )
+            results.append(evidence_sync_result(evidence, "synced"))
+        except (EvidenceStoreError, RazorpayAdapterError) as error:
+            # Preserve previously-synced files and record this file's failure
+            # without leaking raw provider responses or credentials.
+            try:
+                evidence = update_evidence_razorpay_sync(
+                    workflow_id,
+                    evidence["evidence_id"],
+                    "failed",
+                )
+            except EvidenceStoreError:
+                pass
+            results.append(evidence_sync_result(evidence, "failed", str(error)))
+
+    persist_connected_sync_status(workflow_id, results)
+    return {
+        "workflow_id": workflow_id,
+        "razorpay_mode": "connected",
+        "evidence_sync_status": (
+            "not_synced"
+            if not results
+            else "partial_failed"
+            if any(result["status"] == "failed" for result in results)
+            and any(result["status"] != "failed" for result in results)
+            else "failed"
+            if any(result["status"] == "failed" for result in results)
+            else "synced"
+        ),
+        "results": results,
+        "handoff": handoff_view(workflow_id),
+    }
+
+
+def sync_demo_evidence(workflow_id: str) -> dict:
+    """Deterministically simulate evidence sync without calling Razorpay."""
+
+    get_dispute_snapshot(workflow_id)
+    verified_evidence = verified_evidence_for_handoff(workflow_id)
+    update_razorpay_handoff(
+        workflow_id,
+        {
+            "razorpay_mode": "demo",
+            "evidence_sync_status": "simulated_demo",
+            "evidence_synced_at": handoff_timestamp(),
+        },
+    )
+    return {
+        "workflow_id": workflow_id,
+        "razorpay_mode": "demo",
+        "evidence_sync_status": "simulated_demo",
+        "results": [
+            {
+                **evidence_sync_result(evidence, "simulated"),
+                "demo_document_reference": demo_document_reference(
+                    evidence["evidence_id"]
+                ),
+            }
+            for evidence in verified_evidence
+        ],
+        "handoff": handoff_view(workflow_id),
+        "message": "DEMO MODE — No data was sent to Razorpay.",
+    }
 
 
 def prepare_connected_handoff(workflow_id: str) -> dict:
@@ -1435,40 +1687,32 @@ def prepare_connected_handoff(workflow_id: str) -> dict:
             detail="At least one verified evidence file is required for a connected Razorpay draft.",
         )
 
+    sync_result = sync_connected_evidence(workflow_id, provider)
+    if any(result["status"] == "failed" for result in sync_result["results"]):
+        update_razorpay_handoff(
+            workflow_id,
+            {
+                "razorpay_mode": "connected",
+                "handoff_status": "failed",
+                "razorpay_draft_status": "not_prepared",
+            },
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Some verified evidence files could not be synced to Razorpay. Review the file statuses and try again.",
+        )
+
     mapped_documents: list[dict[str, str | None]] = []
+    for evidence in verified_evidence_for_handoff(workflow_id):
+        mapping = evidence_mapping(evidence["evidence_category"])
+        mapped_documents.append(
+            {
+                **mapping,
+                "razorpay_document_id": evidence.get("razorpay_document_id"),
+            }
+        )
+
     try:
-        for evidence in verified_evidence:
-            mapping = evidence_mapping(evidence["evidence_category"])
-            document_id = evidence.get("razorpay_document_id")
-            if evidence.get("razorpay_sync_status") != "synced" or not isinstance(
-                document_id, str
-            ):
-                _, file_path = get_evidence_file(workflow_id, evidence["evidence_id"])
-                try:
-                    document_id = provider.upload_document(
-                        file_path,
-                        evidence["original_filename"],
-                        evidence["content_type"],
-                    )
-                except RazorpayAdapterError:
-                    update_evidence_razorpay_sync(
-                        workflow_id,
-                        evidence["evidence_id"],
-                        "failed",
-                    )
-                    raise
-                update_evidence_razorpay_sync(
-                    workflow_id,
-                    evidence["evidence_id"],
-                    "synced",
-                    document_id,
-                )
-            mapped_documents.append(
-                {
-                    **mapping,
-                    "razorpay_document_id": document_id,
-                }
-            )
 
         summary = contest_summary(
             dispute["prediction_snapshot"]["dispute_type"],
@@ -1721,5 +1965,17 @@ def prepare_razorpay_draft(workflow_id: str):
         if razorpay_mode() == "demo":
             return prepare_demo_handoff(workflow_id)
         return prepare_connected_handoff(workflow_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+
+@app.post("/razorpay/{workflow_id}/sync-evidence")
+def sync_razorpay_evidence(workflow_id: str):
+    """Sync verified documents without requiring a Razorpay dispute ID."""
+
+    try:
+        if razorpay_mode() == "demo":
+            return sync_demo_evidence(workflow_id)
+        return sync_connected_evidence(workflow_id)
     except EvidenceStoreError as error:
         raise evidence_error_to_http(error)

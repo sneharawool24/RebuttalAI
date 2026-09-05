@@ -78,6 +78,12 @@ export function prepareRazorpayDraft(workflowId) {
   });
 }
 
+export function syncRazorpayEvidence(workflowId) {
+  return request(`/razorpay/${encodeURIComponent(workflowId)}/sync-evidence`, {
+    method: "POST",
+  });
+}
+
 export function fetchRazorpayDispute({ workflowId, razorpayDisputeId }) {
   return request("/razorpay/dispute/fetch", {
     method: "POST",
@@ -87,4 +93,12 @@ export function fetchRazorpayDispute({ workflowId, razorpayDisputeId }) {
       razorpay_dispute_id: razorpayDisputeId,
     }),
   });
+}
+
+export function fetchIncomingRazorpayDisputes() {
+  return request("/razorpay/incoming-disputes");
+}
+
+export function fetchIncomingRazorpayDispute(workflowId) {
+  return request(`/razorpay/incoming-disputes/${encodeURIComponent(workflowId)}`);
 }

@@ -2,6 +2,8 @@ import { useMemo, useState } from "react";
 import {
   analyzeDispute,
   fetchEvidence,
+  fetchIncomingRazorpayDispute,
+  fetchIncomingRazorpayDisputes,
   fetchRazorpayDispute,
   fetchRazorpayHandoff,
   generateRebuttal,
@@ -9,6 +11,7 @@ import {
   previewEvidenceUrl,
   removeEvidence,
   uploadEvidence,
+  syncRazorpayEvidence,
   verifyEvidence,
 } from "./api";
 
@@ -25,6 +28,21 @@ const INITIAL_FORM = {
   tracking_available: "1",
   merchant_comm_log_exists: "1",
   refund_already_issued: "0",
+};
+
+const WEBHOOK_FORM = {
+  dispute_type: "",
+  order_value: "",
+  days_since_transaction: "",
+  device_ip_match_history: "",
+  auth_flow_type: "",
+  customer_account_age_days: "",
+  customer_past_order_count: "",
+  customer_past_dispute_count: "",
+  delivery_confirmed: "",
+  tracking_available: "",
+  merchant_comm_log_exists: "",
+  refund_already_issued: "",
 };
 
 const DISPUTE_LABELS = {
@@ -54,6 +72,22 @@ function evidencePriority(category, criticalEvidence) {
   if (criticalEvidence.has(category)) return "Critical";
   if (IMPORTANT_EVIDENCE.has(category)) return "Important";
   return "Supporting";
+}
+
+function evidenceSyncLabel(status) {
+  return {
+    not_synced: "Not started",
+    synced: "Synced",
+    partial_failed: "Partially synced",
+    failed: "Sync failed",
+    simulated_demo: "Simulated",
+  }[status] || "Not started";
+}
+
+function incomingAmount(amount, currency) {
+  if (typeof amount !== "number") return "Amount unavailable";
+  if (currency === "INR") return `₹${(amount / 100).toLocaleString("en-IN")}`;
+  return `${amount} ${currency || ""}`.trim();
 }
 
 function draftSections(draft) {
@@ -165,6 +199,9 @@ function App() {
   const [preview, setPreview] = useState(null);
   const [handoff, setHandoff] = useState(null);
   const [razorpayDisputeId, setRazorpayDisputeId] = useState("");
+  const [entryPath, setEntryPath] = useState("manual");
+  const [incomingDisputes, setIncomingDisputes] = useState([]);
+  const [webhookCase, setWebhookCase] = useState(null);
 
   const isUnauthorized = form.dispute_type !== "non_delivery";
   const authenticationOptions = form.dispute_type === "upi_unauthorized"
@@ -221,7 +258,51 @@ function App() {
       merchant_comm_log_exists: Number(form.merchant_comm_log_exists),
       refund_already_issued: Number(form.refund_already_issued),
       start_evidence_workflow: true,
+      existing_workflow_id: webhookCase?.workflow_id || null,
     };
+  }
+
+  async function showIncomingDisputes() {
+    setEntryPath("razorpay");
+    setNotice("");
+    setBusy("incoming-disputes");
+    try {
+      const payload = await fetchIncomingRazorpayDisputes();
+      setIncomingDisputes(payload.disputes);
+    } catch (error) {
+      setNotice(`Unable to load Razorpay disputes: ${error.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function showManualEntry() {
+    setEntryPath("manual");
+    setWebhookCase(null);
+  }
+
+  async function openIncomingDispute(workflowId) {
+    setNotice("");
+    setBusy(`open-incoming-${workflowId}`);
+    try {
+      const incoming = await fetchIncomingRazorpayDispute(workflowId);
+      const prefill = incoming.form_prefill || {};
+      setForm({
+        ...WEBHOOK_FORM,
+        dispute_type: prefill.dispute_type || "",
+        order_value: prefill.order_value == null ? "" : String(prefill.order_value),
+      });
+      setWebhookCase(incoming);
+      setAnalysis(null);
+      setEvidence([]);
+      setHandoff(null);
+      setDraft("");
+      setEntryPath("manual");
+    } catch (error) {
+      setNotice(`Unable to open the Razorpay dispute: ${error.message}`);
+    } finally {
+      setBusy("");
+    }
   }
 
   async function synchronizeEvidence(disputeId = analysis?.dispute_id) {
@@ -395,6 +476,23 @@ function App() {
     }
   }
 
+  async function handleSyncRazorpayEvidence() {
+    if (!analysis?.dispute_id) return;
+    setNotice("");
+    setBusy("sync-razorpay-evidence");
+    try {
+      const payload = await syncRazorpayEvidence(analysis.dispute_id);
+      setHandoff(payload.handoff);
+      if (payload.evidence_sync_status === "partial_failed") {
+        setNotice("Some verified evidence files could not be synced. Review the per-file statuses and try again.");
+      }
+    } catch (error) {
+      setNotice(`Unable to sync verified evidence to Razorpay: ${error.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function handleImportRazorpayDispute(event) {
     event.preventDefault();
     if (!analysis?.dispute_id || !razorpayDisputeId.trim()) return;
@@ -472,12 +570,34 @@ function App() {
       {activeStep === "dispute" && <section className="card">
         <SectionTitle
           step="1"
-          title="Dispute Details"
-          detail="Enter the available case information to begin a new evidence workflow."
+          title="Dispute"
+          detail="Choose how to start this case. Both paths use the same analysis and evidence workflow."
         />
+        <div className="entry-paths" aria-label="Dispute entry path">
+          <div>
+            <strong>How would you like to start?</strong>
+            <small>Manual entry remains available even when Razorpay is disconnected.</small>
+          </div>
+          <div className="entry-path-buttons">
+            <button className={entryPath === "manual" ? "primary" : "secondary"} type="button" onClick={showManualEntry}>Enter Dispute Manually</button>
+            <button className={entryPath === "razorpay" ? "primary" : "secondary"} type="button" onClick={showIncomingDisputes} disabled={busy === "incoming-disputes"}>
+              {busy === "incoming-disputes" ? "Loading…" : "Razorpay Disputes"}
+            </button>
+          </div>
+        </div>
+
+        {entryPath === "manual" && <>
+        {webhookCase && (
+          <div className="webhook-case-banner">
+            <strong>Source: {webhookCase.source_label}</strong>
+            <span>Razorpay Dispute ID: {webhookCase.razorpay_dispute_id}</span>
+            <small>Additional merchant input is required before analysis. Only compatible webhook values were prefilled.</small>
+          </div>
+        )}
         <form className="form-grid" onSubmit={handleAnalyze}>
           <Field label="Dispute type">
-            <select name="dispute_type" value={form.dispute_type} onChange={updateForm}>
+            <select name="dispute_type" value={form.dispute_type} onChange={updateForm} required>
+              <option value="">Select a dispute type</option>
               {Object.entries(DISPUTE_LABELS).map(([value, label]) => (
                 <option key={value} value={value}>{label}</option>
               ))}
@@ -502,14 +622,16 @@ function App() {
           {isUnauthorized ? (
             <>
               <Field label="Device/IP familiarity" helper="Select how the current device and IP compare with prior customer activity.">
-                <select name="device_ip_match_history" value={form.device_ip_match_history} onChange={updateForm}>
+                <select name="device_ip_match_history" value={form.device_ip_match_history} onChange={updateForm} required>
+                  <option value="">Select device/IP familiarity</option>
                   <option value="1">Matches known customer activity</option>
                   <option value="0">Does not match known customer activity</option>
                   <option value="not_recorded">Not recorded in merchant systems</option>
                 </select>
               </Field>
               <Field label="How was the payment authorized?" helper="Choose the flow recorded for this transaction. Only supported recorded flows are shown.">
-                <select name="auth_flow_type" value={form.auth_flow_type} onChange={updateForm}>
+                <select name="auth_flow_type" value={form.auth_flow_type} onChange={updateForm} required>
+                  <option value="">Select the recorded authorization flow</option>
                   {authenticationOptions.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
@@ -519,12 +641,14 @@ function App() {
           ) : (
             <>
               <Field label="Delivery confirmed">
-                <select name="delivery_confirmed" value={form.delivery_confirmed} onChange={updateForm}>
+                <select name="delivery_confirmed" value={form.delivery_confirmed} onChange={updateForm} required>
+                  <option value="">Select delivery status</option>
                   <option value="1">Yes</option><option value="0">No</option>
                 </select>
               </Field>
               <Field label="Tracking available">
-                <select name="tracking_available" value={form.tracking_available} onChange={updateForm}>
+                <select name="tracking_available" value={form.tracking_available} onChange={updateForm} required>
+                  <option value="">Select tracking availability</option>
                   <option value="1">Yes</option><option value="0">No</option>
                 </select>
               </Field>
@@ -532,12 +656,14 @@ function App() {
           )}
 
           <Field label="Customer communication log exists">
-            <select name="merchant_comm_log_exists" value={form.merchant_comm_log_exists} onChange={updateForm}>
+            <select name="merchant_comm_log_exists" value={form.merchant_comm_log_exists} onChange={updateForm} required>
+              <option value="">Select an option</option>
               <option value="1">Yes</option><option value="0">No</option>
             </select>
           </Field>
           <Field label="Refund already issued">
-            <select name="refund_already_issued" value={form.refund_already_issued} onChange={updateForm}>
+            <select name="refund_already_issued" value={form.refund_already_issued} onChange={updateForm} required>
+              <option value="">Select an option</option>
               <option value="1">Yes</option><option value="0">No</option>
             </select>
           </Field>
@@ -547,6 +673,43 @@ function App() {
             </button>
           </div>
         </form>
+        </>}
+
+        {entryPath === "razorpay" && (
+          <section className="incoming-disputes" aria-label="Incoming Razorpay disputes">
+            <h3>Razorpay Disputes</h3>
+            {incomingDisputes.length === 0 ? (
+              <div className="empty-incoming">
+                <strong>No Razorpay disputes received yet.</strong>
+                <p>New Razorpay disputes received through the configured webhook will appear here automatically.</p>
+              </div>
+            ) : (
+              <div className="incoming-dispute-list">
+                {incomingDisputes.map((incoming) => (
+                  <article className="incoming-dispute-card" key={incoming.workflow_id}>
+                    <div>
+                      <p className="eyebrow">{incoming.source_label}</p>
+                      <h3>{DISPUTE_LABELS[incoming.internal_dispute_type] || incoming.reason || "Razorpay dispute"}</h3>
+                      <p>{incoming.razorpay_dispute_id}</p>
+                    </div>
+                    <div className="incoming-dispute-meta">
+                      <span>{incomingAmount(incoming.amount, incoming.currency)}</span>
+                      <span>{incoming.payment_method || "Payment method unavailable"}</span>
+                      <span>{incoming.status || "Status unavailable"}</span>
+                    </div>
+                    <div className="incoming-dispute-action">
+                      {incoming.is_simulated && <span className="status pending-review">Webhook Test</span>}
+                      <small>{incoming.additional_merchant_input_required ? "Additional merchant input required" : "Analysis available"}</small>
+                      <button className="secondary" type="button" disabled={busy === `open-incoming-${incoming.workflow_id}`} onClick={() => openIncomingDispute(incoming.workflow_id)}>
+                        {busy === `open-incoming-${incoming.workflow_id}` ? "Opening…" : "Open Case"}
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
       </section>}
 
       {activeStep === "analysis" && (
@@ -742,17 +905,41 @@ function App() {
             <SectionTitle
               step="6"
               title="Razorpay Handoff"
-              detail="Prepare a merchant-controlled Razorpay draft from verified evidence only."
+              detail="Sync merchant-verified evidence to Razorpay. Final submission remains merchant-controlled."
             />
-            <div className="handoff-status-grid">
-              <div><span>Rebuttal draft</span><strong>{handoff?.rebuttal_ready ? "Ready" : "Not Ready"}</strong></div>
-              <div><span>Verified evidence</span><strong>{handoff ? `${handoff.verified_evidence_count} files` : "Loading…"}</strong></div>
-              <div><span>Critical evidence missing</span><strong>{handoff ? (handoff.critical_evidence_missing.length || "None") : "Loading…"}</strong></div>
-              <div><span>Razorpay mode</span><strong>{handoff ? (handoff.razorpay_mode === "demo" ? "Demo" : "Connected") : "Loading…"}</strong></div>
-              <div><span>Merchant review</span><strong>Required</strong></div>
-              <div><span>Submission status</span><strong>Not submitted</strong></div>
-            </div>
             <p className="handoff-safety">RebuttalAI prepares the dispute response only. Final submission remains a merchant-controlled action.</p>
+
+            <section className="evidence-sync-panel" aria-label="Evidence Sync">
+              <h3>Evidence Sync</h3>
+              <div className="handoff-result-grid">
+                <div><span>Razorpay connection</span><strong>{handoff ? (handoff.razorpay_mode === "demo" ? "Demo" : "Connected") : "Loading…"}</strong></div>
+                <div><span>Verified evidence</span><strong>{handoff ? handoff.verified_evidence_count : "Loading…"}</strong></div>
+                <div><span>Synced to Razorpay</span><strong>{handoff ? handoff.prepared_evidence_count : "Loading…"}</strong></div>
+                <div><span>Waiting to sync</span><strong>{handoff ? handoff.waiting_evidence_count : "Loading…"}</strong></div>
+                <div><span>Evidence sync status</span><strong>{handoff ? evidenceSyncLabel(handoff.evidence_sync_status) : "Loading…"}</strong></div>
+              </div>
+              {handoff?.razorpay_mode === "demo" && (
+                <p className="demo-mode">DEMO MODE — No data was sent to Razorpay.</p>
+              )}
+              {handoff?.razorpay_mode === "connected" && handoff.evidence_sync_status === "synced" && (
+                <p className="sync-success">Evidence successfully synced to Razorpay.</p>
+              )}
+              <button className="primary" type="button" disabled={busy === "sync-razorpay-evidence" || !handoff} onClick={handleSyncRazorpayEvidence}>
+                {busy === "sync-razorpay-evidence" ? "Syncing…" : "Sync Verified Evidence to Razorpay"}
+              </button>
+
+              {handoff?.evidence.length ? (
+                <div className="handoff-evidence-table evidence-sync-records" role="table">
+                  {handoff.evidence.map((item) => (
+                    <div className="handoff-evidence-row" role="row" key={item.evidence_id}>
+                      <div><strong>{item.evidence_category}</strong><small>{item.original_filename}</small></div>
+                      <div><span>Status</span><strong>{item.preparation_status}</strong></div>
+                      <div><span>{item.razorpay_document_id ? "Razorpay Document ID" : "Simulated document reference"}</span><strong>{item.razorpay_document_id || item.demo_document_reference || "Waiting to sync"}</strong></div>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="empty-state">No verified evidence files are currently available for sync.</p>}
+            </section>
 
             {handoff?.razorpay_mode === "connected" && (
               <form className="handoff-import" onSubmit={handleImportRazorpayDispute}>
@@ -765,44 +952,31 @@ function App() {
               </form>
             )}
 
-            <div className="handoff-actions">
-              <button className="primary" type="button" disabled={busy === "prepare-handoff" || !handoff} onClick={handlePrepareRazorpayDraft}>
-                {busy === "prepare-handoff" ? "Preparing…" : "Prepare Razorpay Draft"}
-              </button>
-              <button className="secondary" type="button" onClick={openRazorpayDashboard}>Open Razorpay Dashboard</button>
-            </div>
-          </section>
+            {handoff?.razorpay_mode === "connected" && (
+              <section className="contest-draft-panel" aria-label="Contest Draft status">
+                <h3>Contest Draft</h3>
+                {handoff.razorpay_dispute_id ? (
+                  <>
+                    <p>A Razorpay dispute has been imported. You may prepare a draft for merchant review; this does not submit the dispute.</p>
+                    <button className="primary" type="button" disabled={busy === "prepare-handoff"} onClick={handlePrepareRazorpayDraft}>
+                      {busy === "prepare-handoff" ? "Preparing…" : "Prepare Razorpay Draft"}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <strong>Waiting for Razorpay dispute ID</strong>
+                    <p>Your verified evidence has been uploaded to Razorpay. A Razorpay dispute ID is required before RebuttalAI can prepare a contest draft.</p>
+                  </>
+                )}
+              </section>
+            )}
 
-          {handoff && (
-            <section className="card">
-              <SectionTitle
-                step="6"
-                title={handoff.handoff_status === "prepared_demo" || handoff.handoff_status === "prepared_connected" ? "Draft Prepared" : "Handoff Preparation"}
-                detail={handoff.handoff_status === "prepared_demo" ? "DEMO MODE — No data was sent to Razorpay." : "No dispute has been submitted from RebuttalAI."}
-              />
-              {handoff.handoff_status === "prepared_demo" && (
-                <p className="demo-mode">DEMO MODE — No data was sent to Razorpay. Reference: {handoff.demo_dispute_reference}</p>
-              )}
-              <div className="handoff-result-grid">
-                <div><span>Contest summary</span><strong>{handoff.contest_summary ? "Ready" : "Not prepared"}</strong></div>
-                <div><span>Verified evidence synced/prepared</span><strong>{handoff.prepared_evidence_count}</strong></div>
-                <div><span>Draft status</span><strong>{handoff.razorpay_draft_status === "prepared" ? "Prepared" : "Not prepared"}</strong></div>
+            {handoff && (
+              <div className="handoff-actions">
+                <button className="secondary" type="button" onClick={openRazorpayDashboard}>Open Razorpay Dashboard</button>
               </div>
-              {handoff.contest_summary && <p className="contest-summary"><strong>Contest summary:</strong> {handoff.contest_summary}</p>}
-              {handoff.evidence.length ? (
-                <div className="handoff-evidence-table" role="table">
-                  {handoff.evidence.map((item) => (
-                    <div className="handoff-evidence-row" role="row" key={item.evidence_id}>
-                      <div><strong>{item.evidence_category}</strong><small>{item.original_filename}</small></div>
-                      <div><span>Razorpay field</span><strong>{item.razorpay_bucket}</strong></div>
-                      <div><span>Status</span><strong>{item.preparation_status}</strong></div>
-                      <div><span>Document reference</span><strong>{item.razorpay_document_id || item.demo_document_reference || "Not assigned"}</strong></div>
-                    </div>
-                  ))}
-                </div>
-              ) : <p className="empty-state">No verified evidence files are currently available for handoff.</p>}
-            </section>
-          )}
+            )}
+          </section>
 
           <div className="workflow-actions page-actions">
             <button className="secondary" type="button" onClick={() => navigateTo("rebuttal")}>Back to Rebuttal</button>

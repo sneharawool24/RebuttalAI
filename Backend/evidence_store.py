@@ -30,7 +30,7 @@ def _timestamp() -> str:
 
 
 def _empty_index() -> dict[str, dict[str, Any]]:
-    return {"disputes": {}, "evidence": {}}
+    return {"disputes": {}, "evidence": {}, "webhook_events": {}}
 
 
 def _ensure_storage() -> None:
@@ -53,6 +53,11 @@ def _load_index() -> dict[str, dict[str, Any]]:
             "Evidence storage is unavailable. Please try again later."
         )
 
+    # Earlier evidence-management indexes do not have webhook state. Add it
+    # lazily so existing local workflows remain readable.
+    data.setdefault("webhook_events", {})
+    if not isinstance(data["webhook_events"], dict):
+        raise EvidenceStoreError("Evidence storage is unavailable. Please try again later.")
     return data
 
 
@@ -97,6 +102,108 @@ def create_dispute_snapshot(snapshot: dict[str, Any]) -> str:
     }
     _save_index(index)
     return dispute_id
+
+
+def _new_handoff_state(razorpay_dispute_id: str | None = None) -> dict[str, Any]:
+    return {
+        "razorpay_dispute_id": razorpay_dispute_id,
+        "razorpay_dispute_metadata": None,
+        "handoff_status": "not_prepared",
+        "contest_summary": None,
+        "prepared_at": None,
+        "razorpay_draft_status": "not_prepared",
+        "rebuttal_ready": False,
+        "demo_dispute_reference": None,
+    }
+
+
+def create_or_update_webhook_workflow(
+    event_id: str | None,
+    webhook_metadata: dict[str, Any],
+) -> tuple[str, str]:
+    """Persist a pre-analysis workflow, deduplicated by event and dispute ID."""
+
+    index = _load_index()
+    if event_id and event_id in index["webhook_events"]:
+        return index["webhook_events"][event_id]["workflow_id"], "duplicate_ignored"
+
+    razorpay_dispute_id = webhook_metadata["razorpay_dispute_id"]
+    workflow_id = next(
+        (
+            dispute_id
+            for dispute_id, dispute in index["disputes"].items()
+            if dispute.get("source") == "razorpay_webhook"
+            and dispute.get("webhook_metadata", {}).get("razorpay_dispute_id")
+            == razorpay_dispute_id
+        ),
+        None,
+    )
+
+    if workflow_id:
+        workflow = index["disputes"][workflow_id]
+        workflow["webhook_metadata"] = webhook_metadata
+        workflow["updated_at"] = _timestamp()
+        workflow.setdefault("razorpay_handoff", _new_handoff_state())[
+            "razorpay_dispute_id"
+        ] = razorpay_dispute_id
+        outcome = "updated"
+    else:
+        workflow_id = str(uuid4())
+        index["disputes"][workflow_id] = {
+            "dispute_id": workflow_id,
+            "created_at": _timestamp(),
+            "source": "razorpay_webhook",
+            "webhook_metadata": webhook_metadata,
+            "prediction_snapshot": None,
+            "analysis_ready": False,
+            "razorpay_handoff": _new_handoff_state(razorpay_dispute_id),
+        }
+        outcome = "created"
+
+    if event_id:
+        index["webhook_events"][event_id] = {
+            "workflow_id": workflow_id,
+            "processed_at": _timestamp(),
+        }
+    _save_index(index)
+    return workflow_id, outcome
+
+
+def get_webhook_workflow(workflow_id: str) -> dict[str, Any]:
+    workflow = get_dispute_snapshot(workflow_id)
+    if workflow.get("source") != "razorpay_webhook":
+        raise EvidenceStoreError("Incoming Razorpay dispute was not found.")
+    return workflow
+
+
+def list_webhook_workflows() -> list[dict[str, Any]]:
+    index = _load_index()
+    workflows = [
+        workflow
+        for workflow in index["disputes"].values()
+        if workflow.get("source") == "razorpay_webhook"
+    ]
+    return sorted(
+        workflows,
+        key=lambda workflow: workflow.get("webhook_metadata", {}).get("created_at") or 0,
+        reverse=True,
+    )
+
+
+def attach_prediction_snapshot_to_webhook_workflow(
+    workflow_id: str,
+    snapshot: dict[str, Any],
+) -> None:
+    """Attach the normal prediction snapshot after merchant completes inputs."""
+
+    index = _load_index()
+    workflow = index["disputes"].get(workflow_id)
+    if not workflow or workflow.get("source") != "razorpay_webhook":
+        raise EvidenceStoreError("Incoming Razorpay dispute was not found.")
+    workflow["prediction_snapshot"] = snapshot
+    workflow["analysis_ready"] = True
+    workflow["updated_at"] = _timestamp()
+    _save_index(index)
 
 
 def get_dispute_snapshot(dispute_id: str) -> dict[str, Any]:
