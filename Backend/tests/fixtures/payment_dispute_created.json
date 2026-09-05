@@ -1,0 +1,35 @@
+{
+  "entity": "event",
+  "account_id": "acc_test_rebuttalai",
+  "event": "payment.dispute.created",
+  "contains": ["payment", "dispute"],
+  "rebuttalai_simulated_webhook": true,
+  "payload": {
+    "payment": {
+      "entity": {
+        "id": "pay_test_rebuttalai_001",
+        "entity": "payment",
+        "amount": 429900,
+        "currency": "INR",
+        "order_id": "order_test_rebuttalai_001",
+        "method": "upi",
+        "created_at": 1735689600
+      }
+    },
+    "dispute": {
+      "entity": {
+        "id": "disp_test_rebuttalai_001",
+        "entity": "dispute",
+        "payment_id": "pay_test_rebuttalai_001",
+        "amount": 429900,
+        "currency": "INR",
+        "reason": "unauthorized_transaction",
+        "reason_code": "transaction_not_recognized",
+        "status": "open",
+        "phase": "chargeback",
+        "created_at": 1735689700
+      }
+    }
+  },
+  "created_at": 1735689700
+}
