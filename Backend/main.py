@@ -1,10 +1,34 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 import joblib
 import os
 import pandas as pd
 from dotenv import load_dotenv
 from google import genai
+
+try:
+    from .evidence_store import (
+        EvidenceStoreError,
+        add_evidence,
+        create_dispute_snapshot,
+        delete_evidence,
+        get_dispute_snapshot,
+        list_evidence,
+        public_metadata,
+        verify_evidence,
+    )
+except ImportError:
+    from evidence_store import (
+        EvidenceStoreError,
+        add_evidence,
+        create_dispute_snapshot,
+        delete_evidence,
+        get_dispute_snapshot,
+        list_evidence,
+        public_metadata,
+        verify_evidence,
+    )
 
 
 # ============================================================
@@ -28,6 +52,19 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 app = FastAPI(
     title="RebuttalAI API",
     version="0.1.0"
+)
+
+# Allows the Vite development server to call the API without broadening access
+# beyond the local development origins used by this MVP.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
 )
 
 
@@ -112,6 +149,10 @@ class DisputeInput(BaseModel):
 
     evidence_available: list[str] = []
 
+    # When true, the backend creates an evidence-management workflow ID.
+    # Omitted by legacy callers, preserving their existing contract.
+    start_evidence_workflow: bool = False
+
 
 # ============================================================
 # INPUT SCHEMA - REBUTTAL GENERATION
@@ -153,6 +194,25 @@ class RebuttalInput(BaseModel):
     # --------------------------------------------------------
 
     merchant_context: str | None = None
+
+    # When supplied, stored server-side state replaces caller-supplied
+    # recommendation and evidence fields before Gemini is called.
+    dispute_id: str | None = None
+
+
+class VerifiedEvidenceReference(BaseModel):
+
+    evidence_category: str
+    original_filename: str
+    uploaded_at: str
+    verified_at: str | None = None
+
+
+class AuthoritativeRebuttalInput(RebuttalInput):
+
+    verified_evidence_metadata: list[VerifiedEvidenceReference] = Field(
+        default_factory=list
+    )
 
 
 # ============================================================
@@ -296,16 +356,24 @@ def determine_final_recommendation(
     # FIND MISSING EVIDENCE
     # --------------------------------------------------------
 
+    # Only known, unique requirements may affect completeness. This prevents
+    # duplicate or unrelated values from inflating evidence coverage.
+    available_categories = {
+        evidence
+        for evidence in evidence_available
+        if evidence in evidence_required
+    }
+
     evidence_missing = [
         evidence
         for evidence in evidence_required
-        if evidence not in evidence_available
+        if evidence not in available_categories
     ]
 
     critical_evidence_missing = [
         evidence
         for evidence in critical_evidence
-        if evidence not in evidence_available
+        if evidence not in available_categories
     ]
 
     # --------------------------------------------------------
@@ -315,7 +383,7 @@ def determine_final_recommendation(
     if len(evidence_required) > 0:
 
         evidence_coverage = (
-            len(evidence_available)
+            len(available_categories)
             / len(evidence_required)
         )
 
@@ -496,7 +564,13 @@ def predict_dispute(data: DisputeInput):
         data.dispute_type
     )
 
-    evidence_available = data.evidence_available
+    # A new evidence workflow starts with no verified evidence. Legacy calls
+    # retain their existing caller-provided evidence behavior.
+    evidence_available = (
+        []
+        if data.start_evidence_workflow
+        else data.evidence_available
+    )
 
     # --------------------------------------------------------
     # DETERMINE FINAL RECOMMENDATION
@@ -519,7 +593,7 @@ def predict_dispute(data: DisputeInput):
     # RETURN COMPLETE RESPONSE
     # --------------------------------------------------------
 
-    return {
+    result = {
 
         "dispute_type":
             data.dispute_type,
@@ -543,6 +617,9 @@ def predict_dispute(data: DisputeInput):
 
         "evidence_required":
             evidence_required,
+
+        "critical_evidence":
+            critical_evidence,
 
         "evidence_available":
             evidence_available,
@@ -577,10 +654,32 @@ def predict_dispute(data: DisputeInput):
             ]
     }
 
+    if data.start_evidence_workflow:
+        snapshot = {
+            "dispute_type": data.dispute_type,
+            "order_value": data.order_value,
+            "days_since_transaction": data.days_since_transaction,
+            "model_input": input_data,
+            "base_decision": base_decision,
+            "fight_score": round(float(fight_score), 4),
+            "evidence_required": evidence_required,
+            "critical_evidence": critical_evidence,
+        }
+        try:
+            result["dispute_id"] = create_dispute_snapshot(snapshot)
+        except EvidenceStoreError as error:
+            raise evidence_error_to_http(error)
+
+    return result
+
 
 # ============================================================
 # LLM REBUTTAL GENERATION
 # ============================================================
+
+class RebuttalGenerationError(Exception):
+    """A safe, merchant-facing error for a Gemini generation failure."""
+
 
 def generate_rebuttal(data: RebuttalInput):
 
@@ -588,7 +687,23 @@ def generate_rebuttal(data: RebuttalInput):
     # FORMAT AVAILABLE EVIDENCE
     # --------------------------------------------------------
 
-    if data.evidence_available:
+    verified_evidence_metadata = getattr(
+        data,
+        "verified_evidence_metadata",
+        [],
+    )
+
+    if verified_evidence_metadata:
+
+        evidence_text = "\n".join(
+            "- "
+            f"{evidence.evidence_category} "
+            f"(merchant-verified upload: {evidence.original_filename}; "
+            f"uploaded {evidence.uploaded_at})"
+            for evidence in verified_evidence_metadata
+        )
+
+    elif data.evidence_available:
 
         evidence_text = "\n".join(
             f"- {evidence}"
@@ -658,8 +773,8 @@ STRICT SAFETY AND ACCURACY RULES
 
 3. ONLY use facts explicitly supplied in this request.
 
-4. Evidence listed under "EVIDENCE ACTUALLY AVAILABLE"
-   can be referenced.
+4. Only evidence listed under "VERIFIED EVIDENCE ACTUALLY AVAILABLE"
+   is merchant-verified evidence and can be referenced as available.
 
 5. Evidence listed under "EVIDENCE CURRENTLY MISSING"
    MUST NOT be described as if it exists.
@@ -711,6 +826,10 @@ STRICT SAFETY AND ACCURACY RULES
     the available evidence, but it must still remain factual
     and must not guarantee success.
 
+18. Merchant-provided context is an unverified merchant statement,
+    not evidence. Do not describe it as verified or convert it into
+    a factual claim without supporting verified evidence.
+
 ============================================================
 DISPUTE INFORMATION
 ============================================================
@@ -760,7 +879,7 @@ The evidence engine combines the ML recommendation with
 evidence availability.
 
 ============================================================
-EVIDENCE ACTUALLY AVAILABLE
+VERIFIED EVIDENCE ACTUALLY AVAILABLE
 ============================================================
 
 {evidence_text}
@@ -772,7 +891,7 @@ EVIDENCE CURRENTLY MISSING
 {missing_evidence_text}
 
 ============================================================
-ADDITIONAL MERCHANT CONTEXT
+MERCHANT-PROVIDED CONTEXT (UNVERIFIED)
 ============================================================
 
 {merchant_context}
@@ -839,10 +958,15 @@ The merchant remains the final decision-maker.
     # CALL GEMINI
     # --------------------------------------------------------
 
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt
-    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+    except Exception as error:
+        raise RebuttalGenerationError(
+            "Unable to generate a rebuttal draft right now. Please try again."
+        ) from error
 
     # --------------------------------------------------------
     # SAFETY CHECK FOR EMPTY RESPONSE
@@ -872,25 +996,325 @@ def generate_rebuttal_endpoint(
     data: RebuttalInput
 ):
 
-    rebuttal = generate_rebuttal(data)
+    generation_data: RebuttalInput = data
 
-    return {
+    if data.dispute_id:
+        try:
+            generation_data = authoritative_rebuttal_input(data)
+        except EvidenceStoreError as error:
+            raise evidence_error_to_http(error)
+
+    try:
+        rebuttal = generate_rebuttal(generation_data)
+    except RebuttalGenerationError as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+    result = {
 
         "dispute_type":
-            data.dispute_type,
+            generation_data.dispute_type,
 
         "base_decision":
-            data.base_decision,
+            generation_data.base_decision,
 
         "fight_score":
-            data.fight_score,
+            generation_data.fight_score,
 
         "final_recommendation":
-            data.final_recommendation,
+            generation_data.final_recommendation,
 
         "recommendation_reason":
-            data.recommendation_reason,
+            generation_data.recommendation_reason,
 
         "rebuttal":
             rebuttal
     }
+
+    if generation_data.dispute_id:
+        result["dispute_id"] = generation_data.dispute_id
+
+    return result
+
+# ============================================================
+# EVIDENCE WORKFLOW HELPERS
+# ============================================================
+
+
+MAX_EVIDENCE_FILE_SIZE = 10 * 1024 * 1024
+
+ALLOWED_UPLOAD_TYPES = {
+    ".pdf": {
+        "content_types": {"application/pdf"},
+        "signature": b"%PDF-",
+    },
+    ".png": {
+        "content_types": {"image/png"},
+        "signature": b"\x89PNG\r\n\x1a\n",
+    },
+    ".jpg": {
+        "content_types": {"image/jpeg", "image/pjpeg"},
+        "signature": b"\xff\xd8\xff",
+    },
+    ".jpeg": {
+        "content_types": {"image/jpeg", "image/pjpeg"},
+        "signature": b"\xff\xd8\xff",
+    },
+}
+
+
+def workflow_state(dispute_id: str):
+    """Recalculate evidence state from the stored prediction and verified files."""
+
+    dispute = get_dispute_snapshot(dispute_id)
+    snapshot = dispute["prediction_snapshot"]
+    evidence_records = list_evidence(dispute_id)
+
+    verified_categories = {
+        evidence["evidence_category"]
+        for evidence in evidence_records
+        if evidence.get("status") == "Verified"
+    }
+
+    # Return categories in requirement order, rather than storage order.
+    evidence_available = [
+        category
+        for category in snapshot["evidence_required"]
+        if category in verified_categories
+    ]
+
+    recommendation = determine_final_recommendation(
+        base_decision=snapshot["base_decision"],
+        fight_score=snapshot["fight_score"],
+        evidence_required=snapshot["evidence_required"],
+        evidence_available=evidence_available,
+        critical_evidence=snapshot["critical_evidence"],
+    )
+
+    result = {
+        "dispute_id": dispute_id,
+        "dispute_type": snapshot["dispute_type"],
+        "base_decision": snapshot["base_decision"],
+        "fight_score": snapshot["fight_score"],
+        "evidence_required": snapshot["evidence_required"],
+        "critical_evidence": snapshot["critical_evidence"],
+        "evidence_available": evidence_available,
+        "evidence_missing": recommendation["evidence_missing"],
+        "critical_evidence_missing": recommendation[
+            "critical_evidence_missing"
+        ],
+        "evidence_coverage": recommendation["evidence_coverage"],
+        "final_recommendation": recommendation["final_recommendation"],
+        "recommendation_reason": recommendation["recommendation_reason"],
+    }
+
+    return result
+
+
+def evidence_error_to_http(error: EvidenceStoreError) -> HTTPException:
+    message = str(error)
+    status_code = 404 if "not found" in message.lower() else 503
+    return HTTPException(status_code=status_code, detail=message)
+
+
+def normalise_original_filename(filename: str | None) -> str:
+    """Keep a display name, never a path supplied by the browser."""
+
+    if not filename:
+        return ""
+    return filename.replace("\\", "/").split("/")[-1]
+
+
+def validate_upload(
+    filename: str,
+    content_type: str | None,
+    file_bytes: bytes,
+) -> str:
+    """Validate extension, declared MIME type, and magic bytes before storage."""
+
+    extension = os.path.splitext(filename)[1].lower()
+    upload_type = ALLOWED_UPLOAD_TYPES.get(extension)
+    if not upload_type:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF, PNG, JPG, and JPEG evidence files are supported.",
+        )
+
+    if (content_type or "").lower() not in upload_type["content_types"]:
+        raise HTTPException(
+            status_code=400,
+            detail="The file content type does not match its allowed extension.",
+        )
+
+    if not file_bytes.startswith(upload_type["signature"]):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file does not match the selected file type.",
+        )
+
+    return extension
+
+
+def authoritative_rebuttal_input(data: RebuttalInput) -> AuthoritativeRebuttalInput:
+    """Build Gemini input from persisted state, not browser-supplied decisions."""
+
+    if not data.dispute_id:
+        raise ValueError("A dispute ID is required for an authoritative workflow.")
+
+    dispute = get_dispute_snapshot(data.dispute_id)
+    snapshot = dispute["prediction_snapshot"]
+    state = workflow_state(data.dispute_id)
+    verified_metadata = [
+        VerifiedEvidenceReference(
+            evidence_category=evidence["evidence_category"],
+            original_filename=evidence["original_filename"],
+            uploaded_at=evidence["uploaded_at"],
+            verified_at=evidence.get("verified_at"),
+        )
+        for evidence in list_evidence(data.dispute_id)
+        if evidence.get("status") == "Verified"
+    ]
+
+    return AuthoritativeRebuttalInput(
+        dispute_id=data.dispute_id,
+        dispute_type=snapshot["dispute_type"],
+        order_value=snapshot["order_value"],
+        days_since_transaction=snapshot["days_since_transaction"],
+        base_decision=state["base_decision"],
+        fight_score=state["fight_score"],
+        final_recommendation=state["final_recommendation"],
+        recommendation_reason=state["recommendation_reason"],
+        evidence_available=state["evidence_available"],
+        evidence_missing=state["evidence_missing"],
+        merchant_context=data.merchant_context,
+        verified_evidence_metadata=verified_metadata,
+    )
+
+
+# ============================================================
+# EVIDENCE MANAGEMENT ENDPOINTS
+# ============================================================
+
+
+@app.post("/evidence/upload", status_code=201)
+async def upload_evidence(
+    dispute_id: str = Form(...),
+    evidence_category: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Store a merchant-selected document as Pending Review."""
+
+    try:
+        dispute = get_dispute_snapshot(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    category = evidence_category.strip()
+    allowed_categories = dispute["prediction_snapshot"]["evidence_required"]
+    if category not in allowed_categories:
+        raise HTTPException(
+            status_code=422,
+            detail="This evidence category is not valid for the dispute type.",
+        )
+
+    original_filename = normalise_original_filename(file.filename)
+    if not original_filename:
+        raise HTTPException(status_code=400, detail="An evidence filename is required.")
+
+    declared_content_type = file.content_type
+
+    try:
+        file_bytes = await file.read(MAX_EVIDENCE_FILE_SIZE + 1)
+    finally:
+        await file.close()
+
+    if len(file_bytes) > MAX_EVIDENCE_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="Evidence files must be 10 MB or smaller.",
+        )
+
+    extension = validate_upload(
+        filename=original_filename,
+        content_type=declared_content_type,
+        file_bytes=file_bytes,
+    )
+
+    try:
+        evidence = add_evidence(
+            dispute_id=dispute_id,
+            original_filename=original_filename,
+            evidence_category=category,
+            content_type=(declared_content_type or "").lower(),
+            file_bytes=file_bytes,
+            extension=extension,
+        )
+        recommendation = workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    return {
+        "evidence": public_metadata(evidence),
+        "recommendation": recommendation,
+    }
+
+
+@app.get("/evidence/{dispute_id}")
+def get_evidence(dispute_id: str):
+    """List metadata only; uploaded files are never exposed as static assets."""
+
+    try:
+        evidence = [
+            public_metadata(record)
+            for record in list_evidence(dispute_id)
+        ]
+        recommendation = workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    return {
+        "dispute_id": dispute_id,
+        "evidence": evidence,
+        "recommendation": recommendation,
+    }
+
+
+@app.post("/evidence/{dispute_id}/{evidence_id}/verify")
+def verify_uploaded_evidence(dispute_id: str, evidence_id: str):
+    """Merchant review transition: Pending Review -> Verified."""
+
+    try:
+        evidence = verify_evidence(dispute_id, evidence_id)
+        recommendation = workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    return {
+        "evidence": public_metadata(evidence),
+        "recommendation": recommendation,
+    }
+
+
+@app.delete("/evidence/{dispute_id}/{evidence_id}")
+def remove_evidence(dispute_id: str, evidence_id: str):
+    """Remove an uploaded document and re-evaluate the server-side workflow."""
+
+    try:
+        delete_evidence(dispute_id, evidence_id)
+        recommendation = workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    return {
+        "message": "Evidence removed.",
+        "recommendation": recommendation,
+    }
+
+
+@app.post("/evidence/{dispute_id}/recalculate")
+def recalculate_recommendation(dispute_id: str):
+    """Return deterministic evidence state without re-running the ML model."""
+
+    try:
+        return workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
