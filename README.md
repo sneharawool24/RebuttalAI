@@ -1,14 +1,10 @@
 # RebuttalAI
 
-### An AI Intelligence Layer for Razorpay Chargeback Management
+### AI Intelligence Layer for Razorpay Chargeback Management
 
 **RebuttalAI is not a replacement for Razorpay's existing dispute-management system.**
 
-It is an **additional intelligence and decision-support layer** that sits before the merchant's existing Razorpay dispute workflow. Steps to run the project at the end of readme file.
-
-Razorpay already provides the infrastructure to view, contest and manage disputes. RebuttalAI focuses on the decisions that come before submission:
-
-> **Should this dispute be fought? Is contesting economically sensible? Is the required evidence ready? And how can the merchant prepare a stronger rebuttal?**
+It is an additional intelligence and decision-support layer that helps merchants decide **whether a dispute is worth contesting, whether the required evidence is ready, and how to prepare an evidence-grounded rebuttal** before handing the case back to Razorpay.
 
 ```text
 Razorpay Dispute
@@ -23,7 +19,7 @@ Evidence Readiness
       ↓
 Final Recommendation
       ↓
-AI-Assisted Rebuttal
+Gemini-Assisted Rebuttal
       ↓
 Merchant Review
       ↓
@@ -34,19 +30,16 @@ The merchant always remains the final decision-maker.
 
 ---
 
-## The Problem
+## Problem
 
-Chargeback management is not simply an evidence-upload problem.
+Chargeback management requires merchants to quickly determine:
 
-For every dispute, a merchant has to decide:
-
-- Is it worth contesting?
-- How strong is the case?
-- Is critical evidence missing?
+- Is the dispute worth contesting?
 - Is the operational effort justified by the disputed amount?
+- Is critical supporting evidence missing?
 - How should the rebuttal be structured?
 
-RebuttalAI combines **machine learning, cost-aware decisioning, verified evidence management and generative AI** to support these decisions before handing the case back to Razorpay.
+RebuttalAI combines **machine learning, cost-aware decisioning, verified evidence management and generative AI** to assist with these decisions.
 
 ---
 
@@ -54,7 +47,7 @@ RebuttalAI combines **machine learning, cost-aware decisioning, verified evidenc
 
 ### 1. Reason-Specific ML Models
 
-Instead of using one generic classifier, RebuttalAI currently supports three dispute categories:
+Instead of one generic classifier, RebuttalAI uses separate models for different dispute types:
 
 | Dispute Type | Selected Model |
 |---|---|
@@ -62,50 +55,42 @@ Instead of using one generic classifier, RebuttalAI currently supports three dis
 | Netbanking Unauthorized | Random Forest |
 | Non-Delivery | Logistic Regression |
 
-Each model produces a **Fight Score** — an assessment signal used by the decision engine.
+Each model generates a **Fight Score**, which acts as an assessment signal for the decision engine.
 
-> Fight Score is not presented as a guaranteed or calibrated probability of winning.
-
----
+> Fight Score is not a guaranteed or calibrated probability of winning a dispute.
 
 ### 2. Model Evaluation & Visualisation
 
-For every dispute category, we compared:
+For each dispute category, we compared:
 
 - Logistic Regression
 - Random Forest
 - XGBoost
 
-Models were evaluated using:
+Models were evaluated using **Accuracy, Precision, Recall, F1 Score and ROC-AUC**.
 
-**Accuracy • Precision • Recall • F1 Score • ROC-AUC**
-
-The ML experimentation also includes visualisations such as:
+The ML experimentation also includes visualisations for:
 
 - Confusion matrices
-- Accuracy comparison
-- Precision comparison
-- Recall comparison
-- F1 comparison
-- ROC-AUC comparison
+- Accuracy
+- Precision
+- Recall
+- F1 Score
+- ROC-AUC
 
-Final selected models:
-
-| Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
+| Selected Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
 |---|---:|---:|---:|---:|---:|
-| UPI — Random Forest | **91.67%** | 94.22% | 94.22% | 94.22% | 0.9306 |
-| Netbanking — Random Forest | **86.00%** | 88.24% | 88.24% | 88.24% | 0.9109 |
-| Non-Delivery — Logistic Regression | **84.29%** | 96.69% | 82.16% | 88.83% | 0.9047 |
+| UPI — Random Forest | 91.67% | 94.22% | 94.22% | 94.22% | 0.9306 |
+| Netbanking — Random Forest | 86.00% | 88.24% | 88.24% | 88.24% | 0.9109 |
+| Non-Delivery — Logistic Regression | 84.29% | 96.69% | 82.16% | 88.83% | 0.9047 |
 
-The prototype models were trained using **synthetic dispute datasets**, so these metrics demonstrate the modelling pipeline rather than expected production performance.
-
----
+> The prototype models were trained on synthetic dispute datasets. These metrics demonstrate the modelling pipeline and should not be interpreted as expected production performance.
 
 ### 3. Cost-Aware Decision Engine
 
-RebuttalAI does not blindly use the ML classification.
+RebuttalAI does not blindly follow the ML classification.
 
-It estimates the operational effort required to contest the dispute and compares it with the **Dispute Exposure**.
+It considers the estimated operational effort of contesting relative to the amount under dispute:
 
 ```text
 Estimated Contest Cost
@@ -115,11 +100,9 @@ Dispute Exposure
 Required Fight Score
 ```
 
-This means an ₹800 handling effort has a very different significance for a ₹3,000 dispute than for a ₹50,000 dispute.
+This allows the system to require a stronger model signal when contesting would be relatively expensive compared with the disputed amount.
 
-The cost values are centralized **prototype business assumptions** and should be calibrated using merchant-specific operational data in production.
-
----
+The current costs are prototype business assumptions and should be calibrated using merchant-specific operational data in production.
 
 ### 4. Verified Evidence Management
 
@@ -129,135 +112,95 @@ Evidence moves through:
 Missing → Pending Review → Verified
 ```
 
-Only **Verified** documents contribute to evidence readiness.
+Only **Verified evidence** contributes to evidence readiness.
 
-The engine identifies:
+The system identifies required evidence, critical evidence, evidence completeness and missing critical documents.
 
-- required evidence
-- critical evidence
-- missing critical evidence
-- evidence completeness
-
-This allows the final recommendation to distinguish between:
+Final recommendations can therefore be:
 
 **Fight • Review / Collect Evidence • Don't Fight**
 
----
-
 ### 5. Gemini-Assisted Rebuttal
 
-Gemini generates a structured rebuttal using verified evidence.
+Gemini assists in generating a structured rebuttal grounded in verified evidence.
 
-Merchant-provided additional context is kept separate from verified evidence, and internal information such as ML scores and cost thresholds is not inserted into the external rebuttal.
+Merchant-provided additional context is kept separate from verified evidence, while internal ML scores and cost-policy information are excluded from the external rebuttal.
 
-The rebuttal remains a **draft for merchant review**, not an automatically submitted response.
+The generated response remains a **draft for merchant review**.
 
 ---
 
 ## Razorpay Integration
 
-RebuttalAI integrates with the existing Razorpay ecosystem rather than replacing it.
+RebuttalAI integrates with Razorpay's existing dispute infrastructure rather than replacing it.
 
 ### Documents API
 
-In **Connected Mode**, verified evidence can be uploaded through Razorpay's Documents API.
+In Connected Mode, verified evidence can be uploaded through Razorpay's Documents API.
 
-The integration was tested using Razorpay Test Mode and successfully returned real Razorpay:
+This integration was tested using **Razorpay Test Mode** and successfully returned real Razorpay `doc_...` document IDs.
 
-```text
-doc_...
-```
+### Disputes API
 
-document IDs.
-
-### Dispute API
-
-For a real Razorpay dispute, RebuttalAI is designed to fetch the dispute and prepare a contest using:
+For an existing Razorpay dispute, RebuttalAI supports the workflow for preparing a contest draft using:
 
 ```text
 PATCH /v1/disputes/:id/contest
-```
-
-with:
-
-```text
 action: "draft"
 ```
 
-RebuttalAI intentionally does **not** call `action: "submit"` automatically.
+RebuttalAI intentionally does **not** automatically submit or accept disputes.
 
-A real Razorpay:
+A real Razorpay `disp_...` ID is required for the contest-draft workflow.
 
-```text
-disp_...
-```
+### Test-Mode Limitation
 
-ID is required for this workflow.
+Our Razorpay Test account did not contain an actual test dispute. Razorpay's documented merchant Disputes API operates on existing disputes but does not provide a documented endpoint for creating an arbitrary test dispute.
 
-### Why the Full Dispute API Flow Could Not Be Demonstrated
+Therefore, the real **Documents API integration was tested end-to-end**, while the final contest-draft call could not be demonstrated without fabricating a `disp_...` ID.
 
-Our Razorpay Test account did not contain a real test dispute.
-
-Razorpay's documented merchant Disputes API provides operations for existing disputes, such as fetching, accepting and contesting disputes, but does not provide a documented endpoint for creating an arbitrary test dispute.
-
-Therefore we could test real **document synchronization**, but could not truthfully fabricate a `disp_...` ID to demonstrate the final contest-draft call.
-
-The application handles this explicitly:
-
-```text
-No dispute linked
-→ Evidence can still be synchronized
-→ Contest Draft waits for a real Razorpay dispute ID
-```
+RebuttalAI handles this explicitly by waiting for a real Razorpay dispute ID before enabling contest-draft preparation.
 
 ---
 
 ## Razorpay Webhooks
 
-RebuttalAI also implements the Razorpay:
+RebuttalAI implements support for Razorpay's:
 
 ```text
 payment.dispute.created
 ```
 
-webhook flow.
+webhook.
 
-The webhook implementation includes:
+The implementation includes:
 
 - HMAC-SHA256 signature verification
-- exact raw-body validation
-- webhook secret protection
-- duplicate-event/idempotency handling
-- dispute workflow creation
-- dispute-reason normalization
+- Exact raw-body validation
+- Webhook secret protection
+- Duplicate-event/idempotency handling
+- Dispute workflow creation
+- Dispute-reason normalization
 
-### Why a Live Razorpay Webhook Was Not Used in the Demo
+### Webhook Demo Limitation
 
-The webhook integration was tested locally using a correctly signed Razorpay-style `payment.dispute.created` fixture.
+Because the Test account contained no real dispute event, a live Razorpay-generated dispute webhook could not be triggered.
 
-A live Razorpay-generated dispute webhook could not be demonstrated because the Test account had no real dispute event to generate.
+The webhook flow was instead validated locally using a **correctly signed Razorpay-style test fixture**.
 
-We deliberately did **not fabricate a live Razorpay event or represent the local fixture as one**.
-
-The local webhook test is therefore explicitly identified as:
-
-**Razorpay Webhook Test**
-
-rather than a live dispute.
+This is explicitly labelled **Razorpay Webhook Test** in the application and is not represented as a live Razorpay dispute.
 
 ---
 
 ## Safety by Design
 
-RebuttalAI deliberately avoids irreversible automated financial actions.
-
 - No automatic dispute submission
 - No automatic dispute acceptance
 - No fabricated evidence
 - Only verified evidence contributes to evidence readiness
-- API secrets remain backend-side
+- API credentials remain backend-side
 - Webhook signatures are validated
-- Gemini assists with drafting but does not make the final decision
+- Gemini assists with drafting; it does not make the final decision
 - Merchant remains the final reviewer
 
 ---
@@ -272,75 +215,34 @@ RebuttalAI deliberately avoids irreversible automated financial actions.
 
 ---
 
-## Run Locally
+## Prototype Scope & Future Work
 
-### Backend
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r Backend/requirements.txt
-cd Backend
-uvicorn main:app --reload
-```
-
-Create `Backend/.env` with the required local credentials. Never commit secrets.
-
-### Frontend
-
-```powershell
-cd Frontend
-npm install
-npm run dev
-```
-
-Then open the local Vite URL, typically:
-
-```text
-http://localhost:5173
-```
-
----
-
-## Prototype Limitations & Future Scope
-
-The current prototype uses synthetic training data and supports:
+The current prototype supports:
 
 - UPI Unauthorized
 - Netbanking Unauthorized
 - Non-Delivery
 
-Production development would include real authorized historical dispute data, model calibration, merchant-specific operational costs, additional dispute categories, production-grade document storage and deeper merchant order/fulfilment integrations.
+Future development can include training and calibration on authorized real merchant dispute histories, additional dispute categories, merchant-specific operational cost policies, production-grade document storage and deeper order/fulfilment integrations.
 
 ---
 
-## The Idea Behind RebuttalAI
-
-Razorpay already provides the **rails for dispute management**.
-
-RebuttalAI adds the **intelligence before the merchant acts**.
-
-> **ML assesses the dispute.  
-> Cost-aware policy evaluates whether fighting makes business sense.  
-> Evidence management checks readiness.  
-> Gemini assists with the rebuttal.  
-> Razorpay handles the dispute workflow.  
-> The merchant makes the final decision.**
-> ##  Run Locally
+## Run Locally
 
 ### Prerequisites
+
 - Python 3.10+
 - Node.js & npm
 - Git
 
-### 1. Clone the Repository
+### 1. Clone
 
 ```bash
 git clone git@github.com:sneharawool24/RebuttalAI.git
 cd RebuttalAI
 ```
 
-### 2. Set Up the Backend
+### 2. Backend
 
 ```powershell
 python -m venv .venv
@@ -358,16 +260,14 @@ RAZORPAY_KEY_SECRET=your_razorpay_test_key_secret
 RAZORPAY_WEBHOOK_SECRET=your_webhook_secret
 ```
 
-Then start the backend:
+Start the backend:
 
 ```powershell
 cd Backend
 uvicorn main:app --reload
 ```
 
-Backend runs at `http://127.0.0.1:8000`.
-
-### 3. Start the Frontend
+### 3. Frontend
 
 Open another terminal:
 
@@ -383,7 +283,7 @@ Open the Vite URL shown in the terminal, typically:
 http://localhost:5173/
 ```
 
-### 4. Optional — Test the Webhook
+### 4. Optional — Test Webhook
 
 With the backend running:
 
@@ -392,4 +292,10 @@ cd Backend
 python scripts/send_test_webhook.py
 ```
 
-This sends a locally signed `payment.dispute.created` test event. It simulates the webhook flow and is **not a live Razorpay-generated dispute**.
+This sends a locally signed `payment.dispute.created` test event. It validates the webhook workflow but is **not a live Razorpay-generated dispute**.
+
+---
+
+## RebuttalAI in One Line
+
+> **Razorpay provides the dispute-management rails; RebuttalAI adds the intelligence that helps merchants decide how and when to use them.**
