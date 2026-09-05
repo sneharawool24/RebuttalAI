@@ -93,7 +93,12 @@ button { border: 1px solid transparent; border-radius: 6px; font-weight: 700; mi
 .evidence-row strong, .evidence-row small { display: block; overflow-wrap: anywhere; }
 .document-review-help { background: #f8fafc; border-left: 3px solid #8aa6c6; color: #53647a; font-size: .88rem; line-height: 1.45; margin: 0 0 14px; padding: 10px 12px; }
 .empty-state { color: #68758a; margin: 4px 0; }
-.recommendation-grid { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.business-cost-preview { background: #f8fafc; border: 1px solid #e1e8f0; border-radius: 7px; display: grid; gap: 14px; grid-column: 1 / -1; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.25fr); padding: 16px; }
+.business-cost-preview p { color: #243d61; font-size: .78rem; font-weight: 750; letter-spacing: .04em; margin: 0 0 7px; text-transform: uppercase; }
+.business-cost-preview strong { color: #1d3150; display: block; font-size: 1.18rem; margin-bottom: 5px; }
+.business-cost-preview small { color: #68758a; font-size: .78rem; line-height: 1.4; }
+.business-cost-preview ul { color: #43546b; font-size: .82rem; line-height: 1.65; margin: 0; padding-left: 18px; }
+.recommendation-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .recommendation-grid > div { background: #f8fafc; border: 1px solid #e1e8f0; border-radius: 7px; display: grid; gap: 5px; padding: 14px; }
 .recommendation-grid .recommendation-highlight { background: #f4f8fc; border-color: #bdd1e8; }
 .recommendation-grid span { color: #68758a; font-size: .78rem; }
@@ -152,7 +157,7 @@ button { border: 1px solid transparent; border-radius: 6px; font-weight: 700; mi
   .workflow-nav { grid-template-columns: 1fr; }
   .workflow-tab { justify-content: flex-start; padding-left: 15px; }
   .workflow-tab + .workflow-tab { border-left: 0; border-top: 1px solid #e2e8f0; }
-  .form-grid, .decision-grid, .upload-form, .recommendation-grid, .handoff-result-grid, .handoff-import, .incoming-dispute-card { grid-template-columns: 1fr; }
+  .form-grid, .decision-grid, .upload-form, .recommendation-grid, .handoff-result-grid, .handoff-import, .incoming-dispute-card, .business-cost-preview { grid-template-columns: 1fr; }
   .analysis-summary, .generate-row, .workflow-actions, .handoff-actions, .entry-paths { align-items: flex-start; flex-direction: column; gap: 16px; }
   .workflow-action-buttons { width: 100%; }
   .workflow-action-buttons button { flex: 1; }

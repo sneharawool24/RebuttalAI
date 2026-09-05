@@ -307,26 +307,143 @@ class EvidenceManagementApiTests(unittest.TestCase):
         )
         self.assertEqual(recommendation["evidence_coverage"], 0.17)
 
-    def test_deterministic_critical_and_dont_fight_logic(self):
+    def test_automatic_contest_cost_uses_authoritative_evidence_requirements(self):
+        requirements = main.get_evidence_requirements("upi_unauthorized")
+        critical = main.get_critical_evidence("upi_unauthorized")
+        preview = self.client.get(
+            "/business-risk/estimate",
+            params={"dispute_type": "upi_unauthorized", "order_value": 3137.73},
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        payload = preview.json()
+
+        self.assertEqual(len(critical), 2)
+        self.assertEqual(len(requirements) - len(critical), 4)
+        self.assertEqual(payload["estimated_contest_cost"], 800)
+        self.assertEqual(
+            payload["contest_cost_breakdown"],
+            {
+                "base_handling": 300,
+                "critical_evidence": len(critical) * 100,
+                "supporting_evidence": (len(requirements) - len(critical)) * 50,
+                "merchant_review": 100,
+            },
+        )
+
+    def test_cost_ratio_bands_map_to_existing_thresholds(self):
+        for order_value, expected_level, expected_threshold in (
+            (10000, "low", 0.50),
+            (4000, "medium", 0.65),
+            (3000, "high", 0.80),
+        ):
+            response = self.client.get(
+                "/business-risk/estimate",
+                params={"dispute_type": "upi_unauthorized", "order_value": order_value},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["estimated_contest_cost"], 800)
+            self.assertEqual(response.json()["business_risk_level"], expected_level)
+            self.assertEqual(response.json()["decision_threshold"], expected_threshold)
+
+    def test_cost_aware_policy_precedes_evidence_readiness(self):
+        requirements = main.get_evidence_requirements("upi_unauthorized")
+        critical = main.get_critical_evidence("upi_unauthorized")
+        below_high = main.determine_final_recommendation(
+            "Fight", 0.75, requirements, critical, critical, order_value=3000,
+        )
+        high_with_evidence = main.determine_final_recommendation(
+            "Fight", 0.88, requirements, critical, critical, order_value=3000,
+        )
+        high_missing_evidence = main.determine_final_recommendation(
+            "Fight", 0.88, requirements, [], critical, order_value=3000,
+        )
+
+        self.assertEqual(below_high["business_risk_level"], "high")
+        self.assertFalse(below_high["passes_cost_threshold"])
+        self.assertEqual(below_high["final_recommendation"], "Don't Fight")
+        self.assertFalse(below_high["show_false_positive_cost"])
+        self.assertEqual(high_with_evidence["final_recommendation"], "Fight")
+        self.assertTrue(high_with_evidence["show_false_positive_cost"])
+        self.assertEqual(high_missing_evidence["final_recommendation"], "Review / Collect Evidence")
+        self.assertTrue(high_missing_evidence["show_false_positive_cost"])
+
+    def test_internal_legacy_contest_cost_metadata_remains_compatible(self):
         requirements = main.get_evidence_requirements("upi_unauthorized")
         critical = main.get_critical_evidence("upi_unauthorized")
 
-        missing_critical = main.determine_final_recommendation(
-            "Fight", 0.9, requirements, [], critical
+        fighting = main.determine_final_recommendation(
+            "Fight", 0.88, requirements, critical, critical, order_value=3000,
         )
-        ready_to_fight = main.determine_final_recommendation(
-            "Fight", 0.9, requirements, critical, critical
+        not_fighting = main.determine_final_recommendation(
+            "Don't Fight", 0.20, requirements, critical, critical, order_value=3000,
         )
-        dont_fight = main.determine_final_recommendation(
-            "Don't Fight", 0.9, requirements, critical, critical
-        )
+        self.assertEqual(fighting["estimated_contest_cost"], 800)
+        self.assertEqual(fighting["estimated_false_positive_cost"], 800)
+        self.assertTrue(fighting["show_false_positive_cost"])
+        self.assertEqual(not_fighting["final_recommendation"], "Don't Fight")
+        self.assertEqual(not_fighting["estimated_false_positive_cost"], 800)
+        self.assertFalse(not_fighting["show_false_positive_cost"])
 
-        self.assertEqual(
-            missing_critical["final_recommendation"],
-            "Review / Collect Evidence",
+    def test_merchant_ui_hides_internal_risk_band_and_duplicate_cost_exposure(self):
+        app_source = (
+            Path(__file__).resolve().parents[2] / "Frontend" / "src" / "App.jsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("Business Risk Level", app_source)
+        self.assertNotIn("Estimated False-Positive Cost Exposure", app_source)
+        self.assertIn("Estimated Contest Cost", app_source)
+        self.assertIn("Required Fight Score", app_source)
+        self.assertIn("Meets threshold", app_source)
+        self.assertIn("Below threshold", app_source)
+
+    def test_legacy_manual_business_settings_are_ignored_safely(self):
+        payload = self.prediction_payload()
+        payload.update(
+            {
+                "false_positive_sensitivity": "low",
+                "contest_handling_cost": 1,
+                "staff_operational_cost": 1,
+            }
         )
-        self.assertEqual(ready_to_fight["final_recommendation"], "Fight")
-        self.assertEqual(dont_fight["final_recommendation"], "Don't Fight")
+        response = self.client.post("/predict", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        # UPI's automatic workload estimate is 800; 800 / 3137.73 is high.
+        self.assertEqual(response.json()["business_risk_level"], "high")
+        self.assertEqual(response.json()["decision_threshold"], 0.80)
+        self.assertEqual(response.json()["estimated_contest_cost"], 800)
+
+    def test_older_workflow_ignores_legacy_manual_sensitivity(self):
+        workflow = self.create_workflow()
+        dispute_id = workflow["dispute_id"]
+        index = evidence_store._load_index()
+        snapshot = index["disputes"][dispute_id]["prediction_snapshot"]
+        snapshot["false_positive_sensitivity"] = "high"
+        snapshot["order_value"] = 10000
+        snapshot["fight_score"] = 0.55
+        evidence_store._save_index(index)
+
+        response = self.client.post(f"/evidence/{dispute_id}/recalculate")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["business_risk_level"], "low")
+        self.assertEqual(response.json()["decision_threshold"], 0.50)
+        self.assertTrue(response.json()["passes_cost_threshold"])
+        self.assertEqual(response.json()["estimated_contest_cost"], 800)
+        self.assertTrue(response.json()["show_false_positive_cost"])
+
+    def test_legacy_policy_update_endpoint_recalculates_automatic_policy(self):
+        workflow = self.create_workflow()
+        response = self.client.post(
+            f"/workflows/{workflow['dispute_id']}/business-risk",
+            json={"false_positive_sensitivity": "low", "contest_handling_cost": 1},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["business_risk_level"], "high")
+        self.assertEqual(response.json()["decision_threshold"], 0.80)
+        snapshot = evidence_store.get_dispute_snapshot(workflow["dispute_id"])[
+            "prediction_snapshot"
+        ]
+        self.assertEqual(snapshot["estimated_contest_cost"], 800)
+        self.assertEqual(snapshot["business_risk_level"], "high")
 
     def test_verified_critical_categories_update_workflow_to_fight(self):
         workflow = self.create_workflow()
@@ -336,6 +453,7 @@ class EvidenceManagementApiTests(unittest.TestCase):
         # selection; deterministic recommendation behavior is under test.
         index = evidence_store._load_index()
         index["disputes"][dispute_id]["prediction_snapshot"]["base_decision"] = "Fight"
+        index["disputes"][dispute_id]["prediction_snapshot"]["fight_score"] = 0.90
         evidence_store._save_index(index)
 
         before = self.client.post(f"/evidence/{dispute_id}/recalculate")

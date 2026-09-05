@@ -212,6 +212,38 @@ def attach_prediction_snapshot_to_webhook_workflow(
     _save_index(index)
 
 
+def update_business_risk_settings(
+    dispute_id: str,
+    false_positive_sensitivity: str,
+    contest_handling_cost: float,
+    staff_operational_cost: float,
+    business_risk_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Persist business-risk settings without re-running the ML model."""
+
+    index = _load_index()
+    workflow = index["disputes"].get(dispute_id)
+    if not workflow or not isinstance(workflow.get("prediction_snapshot"), dict):
+        raise EvidenceStoreError("Dispute workflow was not found or has not been analyzed.")
+
+    workflow["prediction_snapshot"]["false_positive_sensitivity"] = (
+        false_positive_sensitivity
+    )
+    workflow["prediction_snapshot"]["contest_handling_cost"] = contest_handling_cost
+    workflow["prediction_snapshot"]["staff_operational_cost"] = staff_operational_cost
+    if business_risk_metadata:
+        for field in (
+            "decision_threshold",
+            "passes_cost_threshold",
+            "business_risk_reason",
+            "estimated_false_positive_cost",
+        ):
+            if field in business_risk_metadata:
+                workflow["prediction_snapshot"][field] = business_risk_metadata[field]
+    workflow["updated_at"] = _timestamp()
+    _save_index(index)
+
+
 def get_dispute_snapshot(dispute_id: str) -> dict[str, Any]:
     index = _load_index()
     dispute = index["disputes"].get(dispute_id)

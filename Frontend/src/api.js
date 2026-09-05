@@ -29,6 +29,22 @@ export function analyzeDispute(payload) {
   });
 }
 
+export function fetchBusinessRiskEstimate(disputeType, orderValue) {
+  const params = new URLSearchParams({
+    dispute_type: disputeType,
+    order_value: String(orderValue),
+  });
+  return request(`/business-risk/estimate?${params.toString()}`);
+}
+
+export function updateBusinessRiskPolicy(workflowId, settings) {
+  return request(`/workflows/${encodeURIComponent(workflowId)}/business-risk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+}
+
 export function fetchEvidence(disputeId) {
   return request(`/evidence/${encodeURIComponent(disputeId)}`);
 }

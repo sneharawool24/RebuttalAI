@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   analyzeDispute,
+  fetchBusinessRiskEstimate,
   fetchEvidence,
   fetchIncomingRazorpayDispute,
   fetchIncomingRazorpayDisputes,
@@ -90,6 +91,17 @@ function incomingAmount(amount, currency) {
   return `${amount} ${currency || ""}`.trim();
 }
 
+function formatInr(amount) {
+  const numericAmount = Number(amount);
+  const safeAmount = Number.isFinite(numericAmount) ? numericAmount : 0;
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(safeAmount);
+}
+
 function draftSections(draft) {
   const headings = [
     "Subject",
@@ -162,9 +174,25 @@ function DecisionCard({ analysis, onBack, onContinue }) {
           <small>Assessment signal only — not a probability of winning or a guaranteed outcome.</small>
         </div>
         <div>
+          <p className="metric-label">Dispute Exposure</p>
+          <strong>{formatInr(analysis.order_value)}</strong>
+          <small>Amount currently under dispute.</small>
+        </div>
+        <div>
           <p className="metric-label">Base Decision</p>
           <strong>{analysis.base_decision}</strong>
           <small>ML output before evidence review.</small>
+        </div>
+        <div>
+          <p className="metric-label">Required Fight Score</p>
+          <strong>{(Number(analysis.decision_threshold) * 100).toFixed(0)}%</strong>
+          <small>Minimum model signal required after considering estimated contest cost relative to the amount under dispute.</small>
+          <small>{analysis.passes_cost_threshold ? "Meets threshold" : "Below threshold"}</small>
+        </div>
+        <div>
+          <p className="metric-label">Estimated Contest Cost</p>
+          <strong>{formatInr(analysis.estimated_contest_cost)}</strong>
+          <small>Prototype estimate based on expected dispute-handling workload.</small>
         </div>
         <div className={`recommendation ${recommendationClass}`}>
           <p className="metric-label">Final Recommendation</p>
@@ -202,6 +230,7 @@ function App() {
   const [entryPath, setEntryPath] = useState("manual");
   const [incomingDisputes, setIncomingDisputes] = useState([]);
   const [webhookCase, setWebhookCase] = useState(null);
+  const [businessCostPreview, setBusinessCostPreview] = useState(null);
 
   const isUnauthorized = form.dispute_type !== "non_delivery";
   const authenticationOptions = form.dispute_type === "upi_unauthorized"
@@ -222,6 +251,26 @@ function App() {
     return categories;
   }, [evidence]);
   const renderedDraftSections = useMemo(() => draftSections(draft), [draft]);
+
+  useEffect(() => {
+    const orderValue = Number(form.order_value);
+    if (!form.dispute_type || !Number.isFinite(orderValue) || orderValue < 0) {
+      setBusinessCostPreview(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    fetchBusinessRiskEstimate(form.dispute_type, orderValue)
+      .then((estimate) => {
+        if (!cancelled) setBusinessCostPreview(estimate);
+      })
+      .catch(() => {
+        if (!cancelled) setBusinessCostPreview(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.dispute_type, form.order_value]);
 
   function updateForm(event) {
     const { name, value } = event.target;
@@ -618,6 +667,21 @@ function App() {
           <Field label="Order value (₹)">
             <input name="order_value" type="number" min="0" step="0.01" required value={form.order_value} onChange={updateForm} />
           </Field>
+          {businessCostPreview && (
+            <section className="business-cost-preview" aria-label="Estimated contest cost">
+              <div>
+                <p>Estimated contest cost</p>
+                <strong>{formatInr(businessCostPreview.estimated_contest_cost)}</strong>
+                <small>Prototype estimate based on expected dispute-handling workload.</small>
+              </div>
+              <ul>
+                <li>Base handling: {formatInr(businessCostPreview.contest_cost_breakdown.base_handling)}</li>
+                <li>Critical evidence preparation: {formatInr(businessCostPreview.contest_cost_breakdown.critical_evidence)}</li>
+                <li>Supporting evidence preparation: {formatInr(businessCostPreview.contest_cost_breakdown.supporting_evidence)}</li>
+                <li>Merchant review: {formatInr(businessCostPreview.contest_cost_breakdown.merchant_review)}</li>
+              </ul>
+            </section>
+          )}
           <Field label="Days since transaction">
             <input name="days_since_transaction" type="number" min="0" required value={form.days_since_transaction} onChange={updateForm} />
           </Field>
@@ -833,6 +897,9 @@ function App() {
                 <strong>{analysis.final_recommendation}</strong>
               </div>
               <div><span>Model Fight Score</span><strong>{(Number(analysis.fight_score) * 100).toFixed(2)}%</strong><small>Not a win probability.</small></div>
+              <div><span>Required Fight Score</span><strong>{(Number(analysis.decision_threshold) * 100).toFixed(0)}%</strong><small>{analysis.passes_cost_threshold ? "Meets threshold" : "Below threshold"}. Minimum model signal required after considering estimated contest cost relative to the amount under dispute.</small></div>
+              <div><span>Dispute Exposure</span><strong>{formatInr(analysis.order_value)}</strong><small>Amount currently under dispute.</small></div>
+              <div><span>Estimated Contest Cost</span><strong>{formatInr(analysis.estimated_contest_cost)}</strong><small>Prototype estimate based on expected dispute-handling workload.</small></div>
               <div><span>Evidence completeness</span><strong>{(Number(analysis.evidence_coverage) * 100).toFixed(0)}%</strong></div>
               <div><span>Critical evidence missing</span><strong>{analysis.critical_evidence_missing.length || "None"}</strong></div>
             </div>

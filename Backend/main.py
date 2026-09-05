@@ -1,8 +1,9 @@
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat
 from datetime import datetime, timezone
+from typing import Literal
 import joblib
 import json
 import os
@@ -27,6 +28,7 @@ try:
         mark_rebuttal_ready,
         public_metadata,
         update_evidence_razorpay_sync,
+        update_business_risk_settings,
         update_razorpay_handoff,
         verify_evidence,
     )
@@ -44,6 +46,11 @@ try:
         public_incoming_dispute,
         signature_is_valid,
     )
+    from .business_risk import (
+        CONTEST_CONSIDERATION_RECOMMENDATIONS,
+        calculate_business_cost_context,
+        evaluate_business_risk,
+    )
 except ImportError:
     from evidence_store import (
         EvidenceStoreError,
@@ -60,6 +67,7 @@ except ImportError:
         mark_rebuttal_ready,
         public_metadata,
         update_evidence_razorpay_sync,
+        update_business_risk_settings,
         update_razorpay_handoff,
         verify_evidence,
     )
@@ -76,6 +84,11 @@ except ImportError:
         extract_dispute_metadata,
         public_incoming_dispute,
         signature_is_valid,
+    )
+    from business_risk import (
+        CONTEST_CONSIDERATION_RECOMMENDATIONS,
+        calculate_business_cost_context,
+        evaluate_business_risk,
     )
 
 
@@ -162,6 +175,13 @@ class DisputeInput(BaseModel):
     order_value: float
     days_since_transaction: int
 
+    # Merchant policy setting. This does not alter the trained ML model.
+    false_positive_sensitivity: Literal["low", "medium", "high"] = "medium"
+
+    # Merchant-entered business estimates only. Never included in ML inputs.
+    contest_handling_cost: FiniteFloat = Field(default=0, ge=0)
+    staff_operational_cost: FiniteFloat = Field(default=0, ge=0)
+
     # --------------------------------------------------------
     # Authentication / fraud-related features
     # --------------------------------------------------------
@@ -204,6 +224,14 @@ class DisputeInput(BaseModel):
     # Used only when a merchant opens a pre-analysis Razorpay webhook case.
     # It lets the existing prediction result attach to that same workflow.
     existing_workflow_id: str | None = None
+
+
+class BusinessRiskPolicyInput(BaseModel):
+    """Policy-only update for an existing workflow; does not invoke ML."""
+
+    false_positive_sensitivity: Literal["low", "medium", "high"] | None = None
+    contest_handling_cost: FiniteFloat | None = Field(default=None, ge=0)
+    staff_operational_cost: FiniteFloat | None = Field(default=None, ge=0)
 
 
 # ============================================================
@@ -488,7 +516,8 @@ def determine_final_recommendation(
     fight_score,
     evidence_required,
     evidence_available,
-    critical_evidence
+    critical_evidence,
+    order_value=None,
 ):
 
     # --------------------------------------------------------
@@ -534,43 +563,54 @@ def determine_final_recommendation(
     # FINAL DECISION
     # --------------------------------------------------------
 
-    # CASE 1:
-    # ML model says DON'T FIGHT
+    # The model class is retained as a transparent ML output, but it must not
+    # bypass the automatically derived business-cost policy. The Fight Score
+    # is only an assessment signal, not a win-probability estimate.
+    business_risk = evaluate_business_risk(
+        fight_score=fight_score,
+        order_value=order_value,
+        evidence_required=evidence_required,
+        critical_evidence=critical_evidence,
+    )
 
-    if base_decision == "Don't Fight":
+    # CASE 1: the Fight Score does not meet the business-risk threshold.
+    if not business_risk["passes_cost_threshold"]:
 
         final_recommendation = "Don't Fight"
 
         recommendation_reason = (
-            "The dispute model does not recommend contesting "
-            "this dispute based on the available dispute signals."
+            f"{business_risk['business_risk_reason']} "
+            "RebuttalAI does not recommend a dispute fight under the current policy."
         )
 
-    # CASE 2:
-    # ML says FIGHT but critical evidence is missing
+    # CASE 2: the policy threshold is met but critical evidence is missing.
 
     elif len(critical_evidence_missing) > 0:
 
         final_recommendation = "Review / Collect Evidence"
 
         recommendation_reason = (
-            "The dispute model recommends fighting, but "
-            "critical supporting evidence is missing. "
+            f"{business_risk['business_risk_reason']} Critical supporting evidence is missing. "
             "Collect the missing evidence before deciding "
             "whether to contest."
         )
 
-    # CASE 3:
-    # ML says FIGHT and critical evidence is available
+    # CASE 3: the policy threshold and critical evidence requirements are met.
 
     else:
 
         final_recommendation = "Fight"
 
         recommendation_reason = (
-            "The dispute model recommends fighting and "
-            "the required critical evidence is available."
+            f"{business_risk['business_risk_reason']} "
+            "All required critical evidence is verified."
         )
+
+    # Costs are relevant only while a contest is still under consideration.
+    # This is derived from canonical backend outcomes, not UI presentation text.
+    business_risk["show_false_positive_cost"] = (
+        final_recommendation in CONTEST_CONSIDERATION_RECOMMENDATIONS
+    )
 
     # --------------------------------------------------------
     # RETURN RESULT
@@ -593,15 +633,42 @@ def determine_final_recommendation(
             final_recommendation
         ),
 
-        "recommendation_reason": (
-            recommendation_reason
-        )
+        "recommendation_reason": recommendation_reason,
+
+        # Deterministic prototype business policy metadata.
+        **business_risk,
     }
 
 
 # ============================================================
 # PREDICTION ENDPOINT
 # ============================================================
+
+@app.get("/business-risk/estimate")
+def preview_business_risk_estimate(dispute_type: str, order_value: FiniteFloat):
+    """Return a read-only workload estimate before the merchant analyzes."""
+
+    if dispute_type not in {
+        "upi_unauthorized",
+        "netbanking_unauthorized",
+        "non_delivery",
+    }:
+        raise HTTPException(status_code=422, detail="Unsupported dispute type.")
+    if order_value < 0:
+        raise HTTPException(status_code=422, detail="Order value must be non-negative.")
+
+    evidence_required = get_evidence_requirements(dispute_type)
+    critical_evidence = get_critical_evidence(dispute_type)
+    return {
+        "dispute_type": dispute_type,
+        "order_value": order_value,
+        **calculate_business_cost_context(
+            order_value,
+            evidence_required,
+            critical_evidence,
+        ),
+    }
+
 
 @app.post("/predict")
 def predict_dispute(data: DisputeInput):
@@ -725,7 +792,9 @@ def predict_dispute(data: DisputeInput):
 
         evidence_available=evidence_available,
 
-        critical_evidence=critical_evidence
+        critical_evidence=critical_evidence,
+
+        order_value=data.order_value,
     )
 
     # --------------------------------------------------------
@@ -736,6 +805,8 @@ def predict_dispute(data: DisputeInput):
 
         "dispute_type":
             data.dispute_type,
+
+        "order_value": data.order_value,
 
         # ----------------------------------------------------
         # ML result
@@ -749,6 +820,28 @@ def predict_dispute(data: DisputeInput):
                 float(fight_score),
                 4
             ),
+
+        "false_positive_sensitivity": recommendation["false_positive_sensitivity"],
+
+        "decision_threshold": recommendation["decision_threshold"],
+
+        "passes_cost_threshold": recommendation["passes_cost_threshold"],
+
+        "business_risk_status": recommendation["business_risk_status"],
+
+        "business_risk_reason": recommendation["business_risk_reason"],
+
+        "business_risk_level": recommendation["business_risk_level"],
+
+        "estimated_contest_cost": recommendation["estimated_contest_cost"],
+
+        "contest_cost_breakdown": recommendation["contest_cost_breakdown"],
+
+        "cost_ratio": recommendation["cost_ratio"],
+
+        "estimated_false_positive_cost": recommendation["estimated_false_positive_cost"],
+
+        "show_false_positive_cost": recommendation["show_false_positive_cost"],
 
         # ----------------------------------------------------
         # Evidence information
@@ -801,6 +894,15 @@ def predict_dispute(data: DisputeInput):
             "model_input": input_data,
             "base_decision": base_decision,
             "fight_score": round(float(fight_score), 4),
+            "false_positive_sensitivity": recommendation["false_positive_sensitivity"],
+            "decision_threshold": recommendation["decision_threshold"],
+            "passes_cost_threshold": recommendation["passes_cost_threshold"],
+            "business_risk_reason": recommendation["business_risk_reason"],
+            "business_risk_level": recommendation["business_risk_level"],
+            "estimated_contest_cost": recommendation["estimated_contest_cost"],
+            "contest_cost_breakdown": recommendation["contest_cost_breakdown"],
+            "cost_ratio": recommendation["cost_ratio"],
+            "estimated_false_positive_cost": recommendation["estimated_false_positive_cost"],
             "evidence_required": evidence_required,
             "critical_evidence": critical_evidence,
         }
@@ -1268,13 +1370,26 @@ def workflow_state(dispute_id: str):
         evidence_required=snapshot["evidence_required"],
         evidence_available=evidence_available,
         critical_evidence=snapshot["critical_evidence"],
+        order_value=snapshot.get("order_value"),
     )
 
     result = {
         "dispute_id": dispute_id,
         "dispute_type": snapshot["dispute_type"],
+        "order_value": snapshot.get("order_value", 0),
         "base_decision": snapshot["base_decision"],
         "fight_score": snapshot["fight_score"],
+        "false_positive_sensitivity": recommendation["false_positive_sensitivity"],
+        "decision_threshold": recommendation["decision_threshold"],
+        "passes_cost_threshold": recommendation["passes_cost_threshold"],
+        "business_risk_status": recommendation["business_risk_status"],
+        "business_risk_reason": recommendation["business_risk_reason"],
+        "business_risk_level": recommendation["business_risk_level"],
+        "estimated_contest_cost": recommendation["estimated_contest_cost"],
+        "contest_cost_breakdown": recommendation["contest_cost_breakdown"],
+        "cost_ratio": recommendation["cost_ratio"],
+        "estimated_false_positive_cost": recommendation["estimated_false_positive_cost"],
+        "show_false_positive_cost": recommendation["show_false_positive_cost"],
         "evidence_required": snapshot["evidence_required"],
         "critical_evidence": snapshot["critical_evidence"],
         "evidence_available": evidence_available,
@@ -1896,6 +2011,22 @@ def recalculate_recommendation(dispute_id: str):
 
     try:
         return workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+
+@app.post("/workflows/{workflow_id}/business-risk")
+def update_business_risk_policy(
+    workflow_id: str,
+    data: BusinessRiskPolicyInput,
+):
+    """Compatibility recalculation endpoint; policy is now automatic."""
+
+    try:
+        # Keep the existing route callable for older clients while ignoring
+        # obsolete manual policy fields. The derived policy is authoritative.
+        del data
+        return workflow_state(workflow_id)
     except EvidenceStoreError as error:
         raise evidence_error_to_http(error)
 
