@@ -1,9 +1,12 @@
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
 import joblib
 import os
 import pandas as pd
+import re
 from dotenv import load_dotenv
 from google import genai
 
@@ -13,10 +16,22 @@ try:
         add_evidence,
         create_dispute_snapshot,
         delete_evidence,
+        get_evidence_file,
         get_dispute_snapshot,
         list_evidence,
+        mark_rebuttal_ready,
         public_metadata,
+        update_evidence_razorpay_sync,
+        update_razorpay_handoff,
         verify_evidence,
+    )
+    from .razorpay_handoff import (
+        RazorpayAdapterError,
+        RazorpayClient,
+        contest_summary,
+        demo_dispute_reference,
+        demo_document_reference,
+        evidence_mapping,
     )
 except ImportError:
     from evidence_store import (
@@ -24,10 +39,22 @@ except ImportError:
         add_evidence,
         create_dispute_snapshot,
         delete_evidence,
+        get_evidence_file,
         get_dispute_snapshot,
         list_evidence,
+        mark_rebuttal_ready,
         public_metadata,
+        update_evidence_razorpay_sync,
+        update_razorpay_handoff,
         verify_evidence,
+    )
+    from razorpay_handoff import (
+        RazorpayAdapterError,
+        RazorpayClient,
+        contest_summary,
+        demo_dispute_reference,
+        demo_document_reference,
+        evidence_mapping,
     )
 
 
@@ -213,6 +240,13 @@ class AuthoritativeRebuttalInput(RebuttalInput):
     verified_evidence_metadata: list[VerifiedEvidenceReference] = Field(
         default_factory=list
     )
+
+
+class RazorpayDisputeFetchInput(BaseModel):
+    """Import an external Razorpay dispute without replacing ML workflow data."""
+
+    workflow_id: str
+    razorpay_dispute_id: str
 
 
 # ============================================================
@@ -681,6 +715,31 @@ class RebuttalGenerationError(Exception):
     """A safe, merchant-facing error for a Gemini generation failure."""
 
 
+def merchant_facing_draft_or_fallback(draft: str) -> str:
+    """Prevent internal decision-support language from reaching the draft UI."""
+
+    forbidden_patterns = (
+        r"\bfight\b",
+        r"\bdon't fight\b",
+        r"\bfight score\b",
+        r"\bmodel\b",
+        r"\bevidence engine\b",
+        r"\bsystem flagged\b",
+        r"\bfinal recommendation\b",
+        r"\breview / collect evidence\b",
+        r"(?m)^recommendation:\s*$",
+        r"(?m)^evidence still needed:\s*$",
+        r"(?m)^merchant review note:\s*$",
+    )
+
+    if any(re.search(pattern, draft, flags=re.IGNORECASE) for pattern in forbidden_patterns):
+        return (
+            "Unable to prepare a suitable draft. Please try again."
+        )
+
+    return draft
+
+
 def generate_rebuttal(data: RebuttalInput):
 
     # --------------------------------------------------------
@@ -696,10 +755,7 @@ def generate_rebuttal(data: RebuttalInput):
     if verified_evidence_metadata:
 
         evidence_text = "\n".join(
-            "- "
-            f"{evidence.evidence_category} "
-            f"(merchant-verified upload: {evidence.original_filename}; "
-            f"uploaded {evidence.uploaded_at})"
+            f"- {evidence.evidence_category} - {evidence.original_filename}"
             for evidence in verified_evidence_metadata
         )
 
@@ -830,6 +886,30 @@ STRICT SAFETY AND ACCURACY RULES
     not evidence. Do not describe it as verified or convert it into
     a factual claim without supporting verified evidence.
 
+19. Do not cite UPI guidelines, payment-network rules, merchant
+    policies, legal standards, or any authority unless that exact
+    source is supplied as verified evidence. Use neutral factual
+    wording instead of unsupported authoritative claims.
+
+20. The model result, Fight Score, final recommendation, evidence engine,
+    recommendation labels, and missing-evidence workflow are INTERNAL
+    merchant decision support. NEVER mention them in the external rebuttal.
+
+21. Merchant verification means the merchant confirmed that an uploaded
+    file belongs to its selected evidence category. It does NOT independently
+    verify every fact inside that file. Do not claim independent verification.
+
+22. Do not infer a document's contents, successful processing, customer
+    authorization, delivery, identity, or provider confirmation from an
+    evidence category or filename alone.
+
+23. Merchant-provided context remains an unverified statement. It may be
+    used only when clearly framed as a merchant statement, never as verified
+    evidence or an established fact.
+
+24. Keep the rebuttal concise and non-repetitive. Do not restate the same
+    authorization, transaction, or evidence claim in multiple paragraphs.
+
 ============================================================
 DISPUTE INFORMATION
 ============================================================
@@ -900,57 +980,40 @@ MERCHANT-PROVIDED CONTEXT (UNVERIFIED)
 TASK
 ============================================================
 
-Write a concise, professional dispute response draft.
+Write a concise, professional merchant-facing dispute response draft.
 
-Use EXACTLY this structure:
+The external draft must contain NO internal decision-support language,
+including: Fight, Don't Fight, Fight Score, model, evidence engine,
+recommendation labels, internal rules, or missing-evidence workflow.
+
+Use EXACTLY this structure and no other sections:
 
 Subject:
 A short professional subject line.
 
-Recommendation:
-State the final recommendation from the evidence engine
-and briefly explain what the merchant should do next.
-
 Rebuttal:
-Write 2-4 concise paragraphs explaining the merchant's
-position using ONLY the supplied facts and available evidence.
-
-If the final recommendation is "Review / Collect Evidence",
-make it clear that additional evidence must be collected
-and verified before contesting.
-
-If the final recommendation is "Don't Fight", do not
-encourage contesting.
-
-If the final recommendation is "Fight", explain the
-merchant's position using only the evidence actually
-available.
+Write up to four short paragraphs:
+1. Identify the dispute and supplied transaction information.
+2. State the merchant's position only where supplied trusted case facts or
+   verified evidence supports it.
+3. Reference the strongest verified evidence without inferring unseen file
+   contents from its category or filename.
+4. Request review or resolution without guaranteeing an outcome.
 
 Evidence Referenced:
-Provide a bullet list containing ONLY evidence that is
-actually available.
+Provide a bullet list containing ONLY verified evidence in this format:
+- Evidence category — original filename
 
 If no evidence is available, write:
 - None provided
-
-Evidence Still Needed:
-Provide a bullet list of missing evidence that could
-strengthen or support the dispute response.
-
-If no evidence is missing, write:
-- None
-
-Merchant Review Note:
-Write one short sentence reminding the merchant to verify
-all factual statements and attach the appropriate evidence
-before submitting.
 
 FINAL REMINDER:
 Never fabricate evidence.
 Never convert missing evidence into existing evidence.
 Never guarantee a successful dispute.
 Never treat Fight Score as a win probability.
-The merchant remains the final decision-maker.
+Never infer facts from evidence categories or filenames.
+Keep internal merchant review information out of the external draft.
 """
 
 
@@ -984,7 +1047,7 @@ The merchant remains the final decision-maker.
     # RETURN GENERATED TEXT
     # --------------------------------------------------------
 
-    return response.text
+    return merchant_facing_draft_or_fallback(response.text)
 
 
 # ============================================================
@@ -1032,6 +1095,12 @@ def generate_rebuttal_endpoint(
 
     if generation_data.dispute_id:
         result["dispute_id"] = generation_data.dispute_id
+        try:
+            mark_rebuttal_ready(generation_data.dispute_id)
+        except EvidenceStoreError:
+            # A generated draft remains available even if the optional handoff
+            # readiness marker cannot be persisted at that moment.
+            pass
 
     return result
 
@@ -1191,6 +1260,249 @@ def authoritative_rebuttal_input(data: RebuttalInput) -> AuthoritativeRebuttalIn
 
 
 # ============================================================
+# RAZORPAY HANDOFF HELPERS
+# ============================================================
+
+
+RAZORPAY_DISPUTE_ID_PATTERN = re.compile(r"disp_[A-Za-z0-9]{8,64}$")
+
+
+def razorpay_mode() -> str:
+    """Read only a non-secret mode flag from backend environment variables."""
+
+    configured_mode = os.getenv("RAZORPAY_MODE", "demo").strip().lower()
+    if configured_mode not in {"demo", "connected"}:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay mode is not configured correctly. Use demo or connected.",
+        )
+    return configured_mode
+
+
+def connected_razorpay_client() -> RazorpayClient:
+    """Construct the provider adapter only when backend credentials are present."""
+
+    key_id = os.getenv("RAZORPAY_KEY_ID")
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET")
+    if not key_id or not key_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Razorpay connected mode is not configured with backend credentials.",
+        )
+    return RazorpayClient(key_id, key_secret)
+
+
+def handoff_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_razorpay_dispute_metadata(provider_dispute: dict) -> dict:
+    """Persist only small, workflow-relevant provider metadata, never raw data."""
+
+    allowed_fields = (
+        "id",
+        "payment_id",
+        "amount",
+        "currency",
+        "reason_code",
+        "respond_by",
+        "status",
+        "phase",
+    )
+    return {
+        field: provider_dispute[field]
+        for field in allowed_fields
+        if field in provider_dispute
+        and isinstance(provider_dispute[field], (str, int, float, type(None)))
+    }
+
+
+def handoff_view(workflow_id: str) -> dict:
+    """Return safe, current handoff state calculated from verified files only."""
+
+    dispute = get_dispute_snapshot(workflow_id)
+    state = workflow_state(workflow_id)
+    mode = razorpay_mode()
+    stored = dispute.get("razorpay_handoff", {})
+    prepared_demo = stored.get("handoff_status") == "prepared_demo"
+    evidence_items = []
+
+    for evidence in list_evidence(workflow_id):
+        if evidence.get("status") != "Verified":
+            continue
+        mapping = evidence_mapping(evidence["evidence_category"])
+        item = {
+            "evidence_id": evidence["evidence_id"],
+            "evidence_category": evidence["evidence_category"],
+            "original_filename": evidence["original_filename"],
+            **mapping,
+            "razorpay_sync_status": evidence.get(
+                "razorpay_sync_status", "not_synced"
+            ),
+            "razorpay_document_id": evidence.get("razorpay_document_id"),
+        }
+        if prepared_demo:
+            item["preparation_status"] = "Prepared for demo"
+            item["demo_document_reference"] = demo_document_reference(
+                evidence["evidence_id"]
+            )
+        elif item["razorpay_sync_status"] == "synced":
+            item["preparation_status"] = "Synced"
+        elif item["razorpay_sync_status"] == "failed":
+            item["preparation_status"] = "Sync failed"
+        else:
+            item["preparation_status"] = "Not synced"
+        evidence_items.append(item)
+
+    return {
+        "workflow_id": workflow_id,
+        "razorpay_mode": mode,
+        "razorpay_dispute_id": stored.get("razorpay_dispute_id"),
+        "razorpay_dispute_metadata": stored.get("razorpay_dispute_metadata"),
+        "handoff_status": stored.get("handoff_status", "not_prepared"),
+        "contest_summary": stored.get("contest_summary"),
+        "prepared_at": stored.get("prepared_at"),
+        "razorpay_draft_status": stored.get("razorpay_draft_status", "not_prepared"),
+        "rebuttal_ready": bool(stored.get("rebuttal_ready")),
+        "verified_evidence_count": len(evidence_items),
+        "prepared_evidence_count": (
+            len(evidence_items)
+            if prepared_demo
+            else sum(
+                item["razorpay_sync_status"] == "synced"
+                for item in evidence_items
+            )
+        ),
+        "critical_evidence_missing": state["critical_evidence_missing"],
+        "submission_status": "not_submitted",
+        "demo_dispute_reference": stored.get("demo_dispute_reference"),
+        "evidence": evidence_items,
+    }
+
+
+def verified_evidence_for_handoff(workflow_id: str) -> list[dict]:
+    """The single verified-only source for both demo and connected handoff."""
+
+    return [
+        evidence
+        for evidence in list_evidence(workflow_id)
+        if evidence.get("status") == "Verified"
+    ]
+
+
+def prepare_demo_handoff(workflow_id: str) -> dict:
+    """Persist a deterministic no-network handoff result for the MVP demo."""
+
+    dispute = get_dispute_snapshot(workflow_id)
+    verified_evidence = verified_evidence_for_handoff(workflow_id)
+    summary = contest_summary(
+        dispute["prediction_snapshot"]["dispute_type"],
+        [evidence["evidence_category"] for evidence in verified_evidence],
+    )
+    update_razorpay_handoff(
+        workflow_id,
+        {
+            "razorpay_mode": "demo",
+            "handoff_status": "prepared_demo",
+            "contest_summary": summary,
+            "prepared_at": handoff_timestamp(),
+            "razorpay_draft_status": "prepared",
+            "demo_dispute_reference": demo_dispute_reference(workflow_id),
+        },
+    )
+    return handoff_view(workflow_id)
+
+
+def prepare_connected_handoff(workflow_id: str) -> dict:
+    """Sync verified files and save a Razorpay *draft*, never a submission."""
+
+    dispute = get_dispute_snapshot(workflow_id)
+    provider = connected_razorpay_client()
+    stored_handoff = dispute.get("razorpay_handoff", {})
+    razorpay_dispute_id = stored_handoff.get("razorpay_dispute_id")
+    if not isinstance(razorpay_dispute_id, str) or not RAZORPAY_DISPUTE_ID_PATTERN.fullmatch(
+        razorpay_dispute_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="A valid Razorpay dispute ID must be imported before preparing a connected draft.",
+        )
+
+    verified_evidence = verified_evidence_for_handoff(workflow_id)
+    if not verified_evidence:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one verified evidence file is required for a connected Razorpay draft.",
+        )
+
+    mapped_documents: list[dict[str, str | None]] = []
+    try:
+        for evidence in verified_evidence:
+            mapping = evidence_mapping(evidence["evidence_category"])
+            document_id = evidence.get("razorpay_document_id")
+            if evidence.get("razorpay_sync_status") != "synced" or not isinstance(
+                document_id, str
+            ):
+                _, file_path = get_evidence_file(workflow_id, evidence["evidence_id"])
+                try:
+                    document_id = provider.upload_document(
+                        file_path,
+                        evidence["original_filename"],
+                        evidence["content_type"],
+                    )
+                except RazorpayAdapterError:
+                    update_evidence_razorpay_sync(
+                        workflow_id,
+                        evidence["evidence_id"],
+                        "failed",
+                    )
+                    raise
+                update_evidence_razorpay_sync(
+                    workflow_id,
+                    evidence["evidence_id"],
+                    "synced",
+                    document_id,
+                )
+            mapped_documents.append(
+                {
+                    **mapping,
+                    "razorpay_document_id": document_id,
+                }
+            )
+
+        summary = contest_summary(
+            dispute["prediction_snapshot"]["dispute_type"],
+            [evidence["evidence_category"] for evidence in verified_evidence],
+        )
+        provider.prepare_draft(razorpay_dispute_id, summary, mapped_documents)
+    except (EvidenceStoreError, RazorpayAdapterError) as error:
+        # A failure never produces a prepared result. Synced document IDs are
+        # retained so a retry cannot upload those same files again.
+        update_razorpay_handoff(
+            workflow_id,
+            {
+                "razorpay_mode": "connected",
+                "handoff_status": "failed",
+                "razorpay_draft_status": "not_prepared",
+            },
+        )
+        raise HTTPException(status_code=502, detail=str(error))
+
+    update_razorpay_handoff(
+        workflow_id,
+        {
+            "razorpay_mode": "connected",
+            "handoff_status": "prepared_connected",
+            "contest_summary": summary,
+            "prepared_at": handoff_timestamp(),
+            "razorpay_draft_status": "prepared",
+            "demo_dispute_reference": None,
+        },
+    )
+    return handoff_view(workflow_id)
+
+
+# ============================================================
 # EVIDENCE MANAGEMENT ENDPOINTS
 # ============================================================
 
@@ -1278,6 +1590,27 @@ def get_evidence(dispute_id: str):
     }
 
 
+@app.get("/evidence/{dispute_id}/{evidence_id}/preview")
+def preview_evidence(dispute_id: str, evidence_id: str):
+    """Serve a registered upload inline without exposing the storage directory."""
+
+    try:
+        evidence, file_path = get_evidence_file(dispute_id, evidence_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+    return FileResponse(
+        path=file_path,
+        media_type=evidence["content_type"],
+        filename=evidence["original_filename"],
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.post("/evidence/{dispute_id}/{evidence_id}/verify")
 def verify_uploaded_evidence(dispute_id: str, evidence_id: str):
     """Merchant review transition: Pending Review -> Verified."""
@@ -1316,5 +1649,77 @@ def recalculate_recommendation(dispute_id: str):
 
     try:
         return workflow_state(dispute_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+
+# ============================================================
+# RAZORPAY HANDOFF ENDPOINTS
+# ============================================================
+
+
+@app.get("/razorpay/{workflow_id}/handoff")
+def get_razorpay_handoff(workflow_id: str):
+    """Return safe handoff state; credentials and raw provider data stay server-side."""
+
+    try:
+        return handoff_view(workflow_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+    except RazorpayAdapterError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+
+
+@app.post("/razorpay/dispute/fetch")
+def fetch_razorpay_dispute(data: RazorpayDisputeFetchInput):
+    """Import limited Razorpay metadata for a connected workflow only."""
+
+    if razorpay_mode() != "connected":
+        raise HTTPException(
+            status_code=400,
+            detail="Razorpay dispute import is available only in connected mode.",
+        )
+    external_id = data.razorpay_dispute_id.strip()
+    if not RAZORPAY_DISPUTE_ID_PATTERN.fullmatch(external_id):
+        raise HTTPException(status_code=422, detail="The Razorpay dispute ID is not valid.")
+
+    try:
+        get_dispute_snapshot(data.workflow_id)
+        provider_dispute = connected_razorpay_client().fetch_dispute(external_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+    except RazorpayAdapterError as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+    if provider_dispute.get("id") != external_id:
+        raise HTTPException(
+            status_code=502,
+            detail="Razorpay returned an unexpected dispute record.",
+        )
+
+    try:
+        update_razorpay_handoff(
+            data.workflow_id,
+            {
+                "razorpay_mode": "connected",
+                "razorpay_dispute_id": external_id,
+                "razorpay_dispute_metadata": safe_razorpay_dispute_metadata(
+                    provider_dispute
+                ),
+            },
+        )
+        return handoff_view(data.workflow_id)
+    except EvidenceStoreError as error:
+        raise evidence_error_to_http(error)
+
+
+@app.post("/razorpay/{workflow_id}/prepare-draft")
+def prepare_razorpay_draft(workflow_id: str):
+    """Prepare a non-submitting Razorpay handoff from verified evidence only."""
+
+    try:
+        if razorpay_mode() == "demo":
+            return prepare_demo_handoff(workflow_id)
+        return prepare_connected_handoff(workflow_id)
     except EvidenceStoreError as error:
         raise evidence_error_to_http(error)

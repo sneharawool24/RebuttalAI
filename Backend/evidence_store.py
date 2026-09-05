@@ -84,6 +84,16 @@ def create_dispute_snapshot(snapshot: dict[str, Any]) -> str:
         "dispute_id": dispute_id,
         "created_at": _timestamp(),
         "prediction_snapshot": snapshot,
+        "razorpay_handoff": {
+            "razorpay_dispute_id": None,
+            "razorpay_dispute_metadata": None,
+            "handoff_status": "not_prepared",
+            "contest_summary": None,
+            "prepared_at": None,
+            "razorpay_draft_status": "not_prepared",
+            "rebuttal_ready": False,
+            "demo_dispute_reference": None,
+        },
     }
     _save_index(index)
     return dispute_id
@@ -128,6 +138,9 @@ def add_evidence(
             "content_type": content_type,
             "file_size": len(file_bytes),
             "stored_filename": stored_filename,
+            "razorpay_sync_status": "not_synced",
+            "razorpay_document_id": None,
+            "razorpay_synced_at": None,
         }
         index["evidence"][evidence_id] = metadata
         _save_index(index)
@@ -150,6 +163,27 @@ def list_evidence(dispute_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def get_evidence_file(dispute_id: str, evidence_id: str) -> tuple[dict[str, Any], Path]:
+    """Resolve only a file that is registered for the requested dispute."""
+
+    index = _load_index()
+    if dispute_id not in index["disputes"]:
+        raise EvidenceStoreError("Dispute workflow was not found.")
+
+    evidence = index["evidence"].get(evidence_id)
+    if not evidence or evidence.get("dispute_id") != dispute_id:
+        raise EvidenceStoreError("Evidence record was not found for this dispute.")
+
+    # The persisted name is server-generated. Taking only its basename and
+    # requiring it to be a direct child of UPLOAD_DIR prevents path traversal.
+    upload_root = UPLOAD_DIR.resolve()
+    file_path = (upload_root / Path(str(evidence.get("stored_filename", ""))).name).resolve()
+    if file_path.parent != upload_root or not file_path.is_file():
+        raise EvidenceStoreError("Evidence file was not found.")
+
+    return evidence, file_path
+
+
 def verify_evidence(dispute_id: str, evidence_id: str) -> dict[str, Any]:
     index = _load_index()
     if dispute_id not in index["disputes"]:
@@ -165,6 +199,55 @@ def verify_evidence(dispute_id: str, evidence_id: str) -> dict[str, Any]:
         _save_index(index)
 
     return evidence
+
+
+def update_evidence_razorpay_sync(
+    dispute_id: str,
+    evidence_id: str,
+    sync_status: str,
+    razorpay_document_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist only real Razorpay document-sync outcomes for verified files."""
+
+    if sync_status not in {"not_synced", "synced", "failed"}:
+        raise EvidenceStoreError("Evidence sync status is invalid.")
+
+    index = _load_index()
+    if dispute_id not in index["disputes"]:
+        raise EvidenceStoreError("Dispute workflow was not found.")
+    evidence = index["evidence"].get(evidence_id)
+    if not evidence or evidence.get("dispute_id") != dispute_id:
+        raise EvidenceStoreError("Evidence record was not found for this dispute.")
+    if evidence.get("status") != "Verified":
+        raise EvidenceStoreError("Only verified evidence can be synced to Razorpay.")
+
+    evidence["razorpay_sync_status"] = sync_status
+    evidence["razorpay_document_id"] = (
+        razorpay_document_id if sync_status == "synced" else None
+    )
+    evidence["razorpay_synced_at"] = _timestamp() if sync_status == "synced" else None
+    _save_index(index)
+    return evidence
+
+
+def update_razorpay_handoff(dispute_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Persist safe handoff state alongside the backend-owned workflow."""
+
+    index = _load_index()
+    dispute = index["disputes"].get(dispute_id)
+    if not dispute:
+        raise EvidenceStoreError("Dispute workflow was not found.")
+
+    handoff = dispute.setdefault("razorpay_handoff", {})
+    handoff.update(updates)
+    _save_index(index)
+    return handoff
+
+
+def mark_rebuttal_ready(dispute_id: str) -> None:
+    """Record that a merchant-facing draft was generated for this workflow."""
+
+    update_razorpay_handoff(dispute_id, {"rebuttal_ready": True})
 
 
 def delete_evidence(dispute_id: str, evidence_id: str) -> None:
@@ -197,4 +280,7 @@ def public_metadata(evidence: dict[str, Any]) -> dict[str, Any]:
         "file_size": evidence["file_size"],
         "content_type": evidence["content_type"],
         "verified_at": evidence.get("verified_at"),
+        "razorpay_sync_status": evidence.get("razorpay_sync_status", "not_synced"),
+        "razorpay_document_id": evidence.get("razorpay_document_id"),
+        "razorpay_synced_at": evidence.get("razorpay_synced_at"),
     }

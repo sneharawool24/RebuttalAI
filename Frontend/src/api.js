@@ -49,6 +49,10 @@ export function verifyEvidence(disputeId, evidenceId) {
   );
 }
 
+export function previewEvidenceUrl(disputeId, evidenceId) {
+  return `${API_BASE_URL}/evidence/${encodeURIComponent(disputeId)}/${encodeURIComponent(evidenceId)}/preview`;
+}
+
 export function removeEvidence(disputeId, evidenceId) {
   return request(
     `/evidence/${encodeURIComponent(disputeId)}/${encodeURIComponent(evidenceId)}`,
@@ -56,16 +60,31 @@ export function removeEvidence(disputeId, evidenceId) {
   );
 }
 
-export function recalculateRecommendation(disputeId) {
-  return request(`/evidence/${encodeURIComponent(disputeId)}/recalculate`, {
-    method: "POST",
-  });
-}
-
 export function generateRebuttal(payload) {
   return request("/generate-rebuttal", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  });
+}
+
+export function fetchRazorpayHandoff(workflowId) {
+  return request(`/razorpay/${encodeURIComponent(workflowId)}/handoff`);
+}
+
+export function prepareRazorpayDraft(workflowId) {
+  return request(`/razorpay/${encodeURIComponent(workflowId)}/prepare-draft`, {
+    method: "POST",
+  });
+}
+
+export function fetchRazorpayDispute({ workflowId, razorpayDisputeId }) {
+  return request("/razorpay/dispute/fetch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      workflow_id: workflowId,
+      razorpay_dispute_id: razorpayDisputeId,
+    }),
   });
 }

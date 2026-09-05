@@ -2,8 +2,11 @@ import { useMemo, useState } from "react";
 import {
   analyzeDispute,
   fetchEvidence,
+  fetchRazorpayDispute,
+  fetchRazorpayHandoff,
   generateRebuttal,
-  recalculateRecommendation,
+  prepareRazorpayDraft,
+  previewEvidenceUrl,
   removeEvidence,
   uploadEvidence,
   verifyEvidence,
@@ -30,6 +33,49 @@ const DISPUTE_LABELS = {
   non_delivery: "Non-delivery",
 };
 
+const WORKFLOW_STEPS = [
+  { id: "dispute", label: "Dispute", number: "1" },
+  { id: "analysis", label: "Analysis", number: "2" },
+  { id: "evidence", label: "Evidence", number: "3" },
+  { id: "recommendation", label: "Recommendation", number: "4" },
+  { id: "rebuttal", label: "Rebuttal", number: "5" },
+  { id: "handoff", label: "Razorpay Handoff", number: "6" },
+];
+
+const IMPORTANT_EVIDENCE = new Set([
+  "Transaction timestamp",
+  "Customer communication",
+  "Merchant transaction/order records",
+  "Order/invoice details",
+  "Refund/cancellation records",
+]);
+
+function evidencePriority(category, criticalEvidence) {
+  if (criticalEvidence.has(category)) return "Critical";
+  if (IMPORTANT_EVIDENCE.has(category)) return "Important";
+  return "Supporting";
+}
+
+function draftSections(draft) {
+  const headings = [
+    "Subject",
+    "Rebuttal",
+    "Evidence Referenced",
+  ];
+  const matches = [...draft.matchAll(
+    /^(Subject|Rebuttal|Evidence Referenced):\s*$/gm,
+  )];
+
+  if (!matches.length) return [{ heading: "Draft", content: draft }];
+
+  return matches.map((match, index) => ({
+    heading: match[1],
+    content: draft
+      .slice(match.index + match[0].length, matches[index + 1]?.index)
+      .trim() || "—",
+  })).filter((section) => headings.includes(section.heading));
+}
+
 function Field({ label, children, helper }) {
   return (
     <label className="field">
@@ -52,15 +98,11 @@ function SectionTitle({ step, title, detail }) {
   );
 }
 
-function DecisionCard({ analysis }) {
+function DecisionCard({ analysis, onBack, onContinue }) {
   if (!analysis) {
     return (
       <section className="card muted-card">
-        <SectionTitle
-          step="2"
-          title="Analyze Dispute"
-          detail="Complete dispute details to receive a model score and workflow recommendation."
-        />
+        <SectionTitle step="2" title="Analysis" detail="Analyze a dispute to view its ML assessment." />
       </section>
     );
   }
@@ -76,14 +118,14 @@ function DecisionCard({ analysis }) {
     <section className="card decision-card">
       <SectionTitle
         step="2"
-        title="Analysis Result"
+        title="Analysis"
         detail={DISPUTE_LABELS[analysis.dispute_type] || analysis.dispute_type}
       />
       <div className="decision-grid">
         <div>
           <p className="metric-label">Model Fight Score</p>
           <strong className="score">{fightScore}</strong>
-          <small>Model score — not a guaranteed outcome.</small>
+          <small>Assessment signal only — not a probability of winning or a guaranteed outcome.</small>
         </div>
         <div>
           <p className="metric-label">Base Decision</p>
@@ -96,6 +138,14 @@ function DecisionCard({ analysis }) {
           <small>{analysis.recommendation_reason}</small>
         </div>
       </div>
+      <div className="workflow-actions analysis-summary">
+        <span><strong>{analysis.evidence_available.length}</strong> verified evidence categories</span>
+        <span><strong>{analysis.critical_evidence_missing.length}</strong> critical evidence categories missing</span>
+        <div className="workflow-action-buttons">
+          <button className="secondary" type="button" onClick={onBack}>Back to Dispute</button>
+          <button className="primary" type="button" onClick={onContinue}>Continue to Evidence</button>
+        </div>
+      </div>
     </section>
   );
 }
@@ -106,12 +156,27 @@ function App() {
   const [evidence, setEvidence] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
+  const [fileInputKey, setFileInputKey] = useState(0);
   const [merchantContext, setMerchantContext] = useState("");
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
+  const [activeStep, setActiveStep] = useState("dispute");
+  const [preview, setPreview] = useState(null);
+  const [handoff, setHandoff] = useState(null);
+  const [razorpayDisputeId, setRazorpayDisputeId] = useState("");
 
   const isUnauthorized = form.dispute_type !== "non_delivery";
+  const authenticationOptions = form.dispute_type === "upi_unauthorized"
+    ? [
+        { value: "pin_entry", label: "Customer entered a UPI PIN" },
+        { value: "collect_request", label: "Customer approved a collect request" },
+        { value: "autopay", label: "Recurring or mandate payment" },
+      ]
+    : [
+        { value: "netbanking_otp", label: "One-time password (OTP) flow" },
+        { value: "saved_credentials", label: "Saved bank credentials" },
+      ];
   const pendingByCategory = useMemo(() => {
     const categories = new Set();
     evidence.forEach((item) => {
@@ -119,10 +184,22 @@ function App() {
     });
     return categories;
   }, [evidence]);
+  const renderedDraftSections = useMemo(() => draftSections(draft), [draft]);
 
   function updateForm(event) {
     const { name, value } = event.target;
-    setForm((current) => ({ ...current, [name]: value }));
+    setForm((current) => {
+      if (name === "dispute_type") {
+        return {
+          ...current,
+          dispute_type: value,
+          auth_flow_type: value === "netbanking_unauthorized"
+            ? "netbanking_otp"
+            : "pin_entry",
+        };
+      }
+      return { ...current, [name]: value };
+    });
   }
 
   function requestPayload() {
@@ -131,7 +208,9 @@ function App() {
       order_value: Number(form.order_value),
       days_since_transaction: Number(form.days_since_transaction),
       device_ip_match_history: isUnauthorized
-        ? Number(form.device_ip_match_history)
+        ? form.device_ip_match_history === "not_recorded"
+          ? null
+          : Number(form.device_ip_match_history)
         : null,
       auth_flow_type: isUnauthorized ? form.auth_flow_type : null,
       customer_account_age_days: Number(form.customer_account_age_days),
@@ -150,6 +229,32 @@ function App() {
     const payload = await fetchEvidence(disputeId);
     setEvidence(payload.evidence);
     setAnalysis(payload.recommendation);
+    return payload;
+  }
+
+  async function synchronizeHandoff(disputeId = analysis?.dispute_id) {
+    if (!disputeId) return;
+    const payload = await fetchRazorpayHandoff(disputeId);
+    setHandoff(payload);
+    return payload;
+  }
+
+  async function navigateTo(step) {
+    if (step === "recommendation" && analysis?.dispute_id) {
+      try {
+        await synchronizeEvidence(analysis.dispute_id);
+      } catch (error) {
+        setNotice(`Unable to refresh the latest recommendation: ${error.message}`);
+      }
+    }
+    if (step === "handoff" && analysis?.dispute_id) {
+      try {
+        await synchronizeHandoff(analysis.dispute_id);
+      } catch (error) {
+        setNotice(`Unable to load Razorpay handoff status: ${error.message}`);
+      }
+    }
+    setActiveStep(step);
   }
 
   async function handleAnalyze(event) {
@@ -162,7 +267,10 @@ function App() {
       const result = await analyzeDispute(requestPayload());
       setAnalysis(result);
       setEvidence([]);
+      setHandoff(null);
+      setRazorpayDisputeId("");
       setSelectedCategory(result.evidence_required?.[0] || "");
+      setActiveStep("analysis");
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -177,16 +285,28 @@ function App() {
     setNotice("");
     setBusy("upload");
     try {
-      await uploadEvidence({
+      const uploadResult = await uploadEvidence({
         disputeId: analysis.dispute_id,
         evidenceCategory: selectedCategory,
         file: selectedFile,
       });
+
+      // Update immediately from the authoritative upload response, then
+      // reconcile from the server. No synthetic event property is accessed
+      // after awaiting the upload request.
+      setEvidence((current) => [...current, uploadResult.evidence]);
+      setAnalysis(uploadResult.recommendation);
       setSelectedFile(null);
-      event.currentTarget.reset();
-      await synchronizeEvidence(analysis.dispute_id);
+      setFileInputKey((current) => current + 1);
+      try {
+        await synchronizeEvidence(analysis.dispute_id);
+      } catch {
+        setNotice(
+          "Evidence was uploaded as Pending Review, but the latest document list could not refresh. The document is saved; please refresh this step.",
+        );
+      }
     } catch (error) {
-      setNotice(error.message);
+      setNotice(`Unable to upload evidence: ${error.message}`);
     } finally {
       setBusy("");
     }
@@ -220,18 +340,13 @@ function App() {
     }
   }
 
-  async function handleRecalculate() {
+  function handlePreview(item) {
     if (!analysis?.dispute_id) return;
-    setNotice("");
-    setBusy("recalculate");
-    try {
-      const result = await recalculateRecommendation(analysis.dispute_id);
-      setAnalysis(result);
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setBusy("");
-    }
+    setPreview({
+      filename: item.original_filename,
+      contentType: item.content_type,
+      url: previewEvidenceUrl(analysis.dispute_id, item.evidence_id),
+    });
   }
 
   async function handleGenerate() {
@@ -253,11 +368,53 @@ function App() {
         merchant_context: merchantContext || null,
       });
       setDraft(response.rebuttal);
+      try {
+        await synchronizeHandoff(analysis.dispute_id);
+      } catch {
+        // The generated draft remains available even if the status card does
+        // not refresh immediately.
+      }
     } catch (error) {
       setNotice(error.message);
     } finally {
       setBusy("");
     }
+  }
+
+  async function handlePrepareRazorpayDraft() {
+    if (!analysis?.dispute_id) return;
+    setNotice("");
+    setBusy("prepare-handoff");
+    try {
+      const payload = await prepareRazorpayDraft(analysis.dispute_id);
+      setHandoff(payload);
+    } catch (error) {
+      setNotice(`Unable to prepare the Razorpay draft: ${error.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function handleImportRazorpayDispute(event) {
+    event.preventDefault();
+    if (!analysis?.dispute_id || !razorpayDisputeId.trim()) return;
+    setNotice("");
+    setBusy("import-razorpay-dispute");
+    try {
+      const payload = await fetchRazorpayDispute({
+        workflowId: analysis.dispute_id,
+        razorpayDisputeId: razorpayDisputeId.trim(),
+      });
+      setHandoff(payload);
+    } catch (error) {
+      setNotice(`Unable to import the Razorpay dispute: ${error.message}`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function openRazorpayDashboard() {
+    window.open("https://dashboard.razorpay.com/", "_blank", "noopener,noreferrer");
   }
 
   async function copyDraft() {
@@ -293,9 +450,26 @@ function App() {
         <p className="review-reminder">Defense support only · Merchant review required</p>
       </header>
 
+      <nav className="workflow-nav" aria-label="Dispute workflow steps">
+        {WORKFLOW_STEPS.map((step) => {
+          const unavailable = step.id !== "dispute" && !analysis;
+          return (
+            <button
+              key={step.id}
+              type="button"
+              disabled={unavailable}
+              className={activeStep === step.id ? "workflow-tab active" : "workflow-tab"}
+              onClick={() => navigateTo(step.id)}
+            >
+              <span>{step.number}</span>{step.label}
+            </button>
+          );
+        })}
+      </nav>
+
       {notice && <div className="notice" role="alert">{notice}</div>}
 
-      <section className="card">
+      {activeStep === "dispute" && <section className="card">
         <SectionTitle
           step="1"
           title="Dispute Details"
@@ -327,14 +501,18 @@ function App() {
 
           {isUnauthorized ? (
             <>
-              <Field label="Device and IP match history" helper="Use a value from 0 to 1.">
-                <input name="device_ip_match_history" type="number" min="0" max="1" step="0.001" required value={form.device_ip_match_history} onChange={updateForm} />
+              <Field label="Device/IP familiarity" helper="Select how the current device and IP compare with prior customer activity.">
+                <select name="device_ip_match_history" value={form.device_ip_match_history} onChange={updateForm}>
+                  <option value="1">Matches known customer activity</option>
+                  <option value="0">Does not match known customer activity</option>
+                  <option value="not_recorded">Not recorded in merchant systems</option>
+                </select>
               </Field>
-              <Field label="Authentication flow">
+              <Field label="How was the payment authorized?" helper="Choose the flow recorded for this transaction. Only supported recorded flows are shown.">
                 <select name="auth_flow_type" value={form.auth_flow_type} onChange={updateForm}>
-                  <option value="pin_entry">PIN entry</option>
-                  <option value="collect_request">Collect request</option>
-                  <option value="otp">OTP</option>
+                  {authenticationOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
                 </select>
               </Field>
             </>
@@ -365,41 +543,42 @@ function App() {
           </Field>
           <div className="form-action">
             <button className="primary" disabled={busy === "analyze"} type="submit">
-              {busy === "analyze" ? "Analyzing…" : "Analyze Dispute"}
+              {busy === "analyze" ? "Analyzing…" : "Analyze & Continue"}
             </button>
           </div>
         </form>
-      </section>
+      </section>}
 
-      <DecisionCard analysis={analysis} />
+      {activeStep === "analysis" && (
+        <DecisionCard
+          analysis={analysis}
+          onBack={() => navigateTo("dispute")}
+          onContinue={() => navigateTo("evidence")}
+        />
+      )}
 
-      {analysis && (
+      {analysis && activeStep === "evidence" && (
         <>
           <section className="card">
             <SectionTitle
               step="3"
-              title="Evidence Checklist"
-              detail="Only merchant-verified uploads count toward evidence completeness."
+              title="Evidence"
+              detail="Only verified documents count toward evidence completeness and the recommendation."
             />
             <div className="checklist">
               {requiredEvidence.map((category) => {
                 const isVerified = availableEvidence.has(category);
                 const isPending = pendingByCategory.has(category);
-                const isCritical = criticalEvidence.has(category);
-                const status = isVerified ? "Verified" : isPending ? "Pending Review" : isCritical ? "Critical Missing" : "Missing";
+                const status = isVerified ? "Verified" : isPending ? "Pending Review" : "Missing";
+                const priority = evidencePriority(category, criticalEvidence);
                 return (
-                  <div className={`check-row ${isCritical ? "critical" : ""}`} key={category}>
+                  <div className={`check-row ${priority.toLowerCase()}`} key={category}>
                     <div>
                       <strong>{category}</strong>
-                      {isCritical && <span className="critical-tag">Critical evidence</span>}
+                      <span className={`priority ${priority.toLowerCase()}`}>{priority}</span>
                     </div>
                     <div className="check-actions">
                       <span className={`status ${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span>
-                      {!isVerified && (
-                        <button type="button" className="text-button" onClick={() => setSelectedCategory(category)}>
-                          Upload
-                        </button>
-                      )}
                     </div>
                   </div>
                 );
@@ -409,7 +588,7 @@ function App() {
 
           <section className="card" id="evidence-upload">
             <SectionTitle
-              step="4"
+              step="3"
               title="Evidence Upload"
               detail="Files remain Pending Review until you explicitly verify the category and document."
             />
@@ -420,7 +599,7 @@ function App() {
                 </select>
               </Field>
               <Field label="Document" helper="PDF, PNG, JPG, or JPEG · maximum 10 MB">
-                <input type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" required onChange={(event) => setSelectedFile(event.target.files?.[0] || null)} />
+                <input key={fileInputKey} type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" required onChange={(event) => setSelectedFile(event.target.files?.[0] || null)} />
               </Field>
               <div className="form-action">
                 <button className="secondary" disabled={busy === "upload"} type="submit">
@@ -432,10 +611,11 @@ function App() {
 
           <section className="card">
             <SectionTitle
-              step="5"
-              title="Evidence Review & Verification"
-              detail="Review each upload before marking it Verified. Uploading alone does not establish a fact."
+              step="3"
+              title="Uploaded Documents"
+              detail="Uploading alone does not establish a fact."
             />
+            <p className="document-review-help">Preview each uploaded document and confirm that it matches the selected evidence category before marking it Verified.</p>
             {evidence.length === 0 ? (
               <p className="empty-state">No files uploaded for this dispute workflow.</p>
             ) : (
@@ -445,9 +625,10 @@ function App() {
                     <div><strong>{item.original_filename}</strong><small>{item.evidence_category}</small></div>
                     <span className={`status ${item.status.toLowerCase().replaceAll(" ", "-")}`}>{item.status}</span>
                     <div className="row-actions">
+                      <button className="secondary small" onClick={() => handlePreview(item)} type="button">Preview</button>
                       {item.status !== "Verified" && (
                         <button className="secondary small" disabled={busy === `verify-${item.evidence_id}`} onClick={() => handleVerify(item.evidence_id)} type="button">
-                          {busy === `verify-${item.evidence_id}` ? "Verifying…" : "Mark Verified"}
+                          {busy === `verify-${item.evidence_id}` ? "Verifying…" : "Verify"}
                         </button>
                       )}
                       <button className="text-button danger" disabled={busy === `remove-${item.evidence_id}`} onClick={() => handleRemove(item.evidence_id)} type="button">Remove</button>
@@ -457,31 +638,49 @@ function App() {
               </div>
             )}
           </section>
+          <div className="workflow-actions page-actions">
+            <button className="secondary" type="button" onClick={() => navigateTo("analysis")}>Back to Analysis</button>
+            <button className="primary" type="button" onClick={() => navigateTo("recommendation")}>Continue to Recommendation</button>
+          </div>
+        </>
+      )}
 
+      {analysis && activeStep === "recommendation" && (
           <section className="card recommendation-update">
             <SectionTitle
-              step="6"
-              title="Recommendation Update"
-              detail="The backend evidence engine recalculates this workflow; the ML model score does not change after upload."
+              step="4"
+              title="Recommendation"
+              detail="The deterministic evidence engine is backend-authoritative; the Model Fight Score remains an assessment signal."
             />
-            <div className="coverage-row">
+            <div className="recommendation-grid">
+              <div className="recommendation-highlight">
+                <span>Final recommendation</span>
+                <strong>{analysis.final_recommendation}</strong>
+              </div>
+              <div><span>Model Fight Score</span><strong>{(Number(analysis.fight_score) * 100).toFixed(2)}%</strong><small>Not a win probability.</small></div>
               <div><span>Evidence completeness</span><strong>{(Number(analysis.evidence_coverage) * 100).toFixed(0)}%</strong></div>
               <div><span>Critical evidence missing</span><strong>{analysis.critical_evidence_missing.length || "None"}</strong></div>
-              <button className="secondary" disabled={busy === "recalculate"} onClick={handleRecalculate} type="button">
-                {busy === "recalculate" ? "Updating…" : "Update Recommendation"}
-              </button>
+            </div>
+            <p className="recommendation-reason"><strong>Why this is recommended:</strong> {analysis.recommendation_reason}</p>
+            <div className="workflow-actions page-actions">
+              <button className="secondary" type="button" onClick={() => navigateTo("evidence")}>Back to Evidence</button>
+              <button className="primary" type="button" onClick={() => navigateTo("rebuttal")}>Continue to Rebuttal</button>
             </div>
           </section>
+      )}
 
+      {analysis && activeStep === "rebuttal" && (
+        <>
           <section className="card">
             <SectionTitle
-              step="7"
+              step="5"
               title="Generate Rebuttal"
               detail="Creates an AI-generated draft using only verified evidence and the backend recommendation."
             />
-            <Field label="Merchant review context" helper="Optional merchant statement. It is not verified evidence.">
-              <textarea value={merchantContext} onChange={(event) => setMerchantContext(event.target.value)} placeholder="Add context for merchant review. Do not enter secrets." rows="4" />
+            <Field label="Additional case context (optional)" helper="Add relevant information that may help draft the response but is not contained in the uploaded evidence.">
+              <textarea value={merchantContext} onChange={(event) => setMerchantContext(event.target.value)} placeholder="Example: Customer contacted support and said they did not recognize the transaction. Customer previously purchased using the same account. Merchant attempted to contact the customer but received no response." rows="5" />
             </Field>
+            <p className="context-note">This is treated as a merchant statement, not verified evidence.</p>
             <div className="generate-row">
               <p>AI-generated draft — merchant review required. No action in RebuttalAI submits a dispute.</p>
               <button className="primary" disabled={busy === "generate"} onClick={handleGenerate} type="button">
@@ -492,21 +691,142 @@ function App() {
 
           <section className="card">
             <SectionTitle
-              step="8"
+              step="5"
               title="Rebuttal Review"
               detail="Review and edit the draft before independently deciding whether to contest."
             />
             {draft ? (
               <>
+                <article className="draft-document" aria-label="Generated rebuttal document">
+                  {renderedDraftSections.map((section) => (
+                    <section key={section.heading} className="draft-section">
+                      <h3>{section.heading}</h3>
+                      <p>{section.content}</p>
+                    </section>
+                  ))}
+                </article>
+                <label className="field draft-edit-label">
+                  <span>Edit draft before using it</span>
                 <textarea className="draft" value={draft} onChange={(event) => setDraft(event.target.value)} rows="16" />
+                </label>
                 <div className="draft-actions">
                   <button className="secondary" onClick={copyDraft} type="button">Copy Draft</button>
                   <button className="secondary" onClick={exportDraft} type="button">Export Draft</button>
                 </div>
+                <aside className="merchant-review-info">
+                  <h3>Merchant Review Information</h3>
+                  <div>
+                    <h4>Additional Supporting Evidence Not Yet Provided</h4>
+                    {analysis.evidence_missing.length ? (
+                      <ul>{analysis.evidence_missing.map((item) => <li key={item}>{item}</li>)}</ul>
+                    ) : <p>None identified by the current evidence checklist.</p>}
+                  </div>
+                  <div>
+                    <h4>Merchant Review Note</h4>
+                    <p>Review all factual statements and ensure the referenced evidence files are attached before using this draft.</p>
+                  </div>
+                </aside>
               </>
             ) : <p className="empty-state">A generated draft will appear here for merchant review.</p>}
           </section>
+          <div className="workflow-actions page-actions">
+            <button className="secondary" type="button" onClick={() => navigateTo("recommendation")}>Back to Recommendation</button>
+            <button className="primary" type="button" onClick={() => navigateTo("handoff")}>Continue to Razorpay Handoff</button>
+          </div>
         </>
+      )}
+
+      {analysis && activeStep === "handoff" && (
+        <>
+          <section className="card handoff-card">
+            <SectionTitle
+              step="6"
+              title="Razorpay Handoff"
+              detail="Prepare a merchant-controlled Razorpay draft from verified evidence only."
+            />
+            <div className="handoff-status-grid">
+              <div><span>Rebuttal draft</span><strong>{handoff?.rebuttal_ready ? "Ready" : "Not Ready"}</strong></div>
+              <div><span>Verified evidence</span><strong>{handoff ? `${handoff.verified_evidence_count} files` : "Loading…"}</strong></div>
+              <div><span>Critical evidence missing</span><strong>{handoff ? (handoff.critical_evidence_missing.length || "None") : "Loading…"}</strong></div>
+              <div><span>Razorpay mode</span><strong>{handoff ? (handoff.razorpay_mode === "demo" ? "Demo" : "Connected") : "Loading…"}</strong></div>
+              <div><span>Merchant review</span><strong>Required</strong></div>
+              <div><span>Submission status</span><strong>Not submitted</strong></div>
+            </div>
+            <p className="handoff-safety">RebuttalAI prepares the dispute response only. Final submission remains a merchant-controlled action.</p>
+
+            {handoff?.razorpay_mode === "connected" && (
+              <form className="handoff-import" onSubmit={handleImportRazorpayDispute}>
+                <Field label="Razorpay dispute ID" helper="Optional for manual/demo cases. A connected draft requires an imported Razorpay dispute ID.">
+                  <input value={razorpayDisputeId} onChange={(event) => setRazorpayDisputeId(event.target.value)} placeholder="disp_..." />
+                </Field>
+                <button className="secondary" type="submit" disabled={busy === "import-razorpay-dispute"}>
+                  {busy === "import-razorpay-dispute" ? "Importing…" : "Import Razorpay Dispute"}
+                </button>
+              </form>
+            )}
+
+            <div className="handoff-actions">
+              <button className="primary" type="button" disabled={busy === "prepare-handoff" || !handoff} onClick={handlePrepareRazorpayDraft}>
+                {busy === "prepare-handoff" ? "Preparing…" : "Prepare Razorpay Draft"}
+              </button>
+              <button className="secondary" type="button" onClick={openRazorpayDashboard}>Open Razorpay Dashboard</button>
+            </div>
+          </section>
+
+          {handoff && (
+            <section className="card">
+              <SectionTitle
+                step="6"
+                title={handoff.handoff_status === "prepared_demo" || handoff.handoff_status === "prepared_connected" ? "Draft Prepared" : "Handoff Preparation"}
+                detail={handoff.handoff_status === "prepared_demo" ? "DEMO MODE — No data was sent to Razorpay." : "No dispute has been submitted from RebuttalAI."}
+              />
+              {handoff.handoff_status === "prepared_demo" && (
+                <p className="demo-mode">DEMO MODE — No data was sent to Razorpay. Reference: {handoff.demo_dispute_reference}</p>
+              )}
+              <div className="handoff-result-grid">
+                <div><span>Contest summary</span><strong>{handoff.contest_summary ? "Ready" : "Not prepared"}</strong></div>
+                <div><span>Verified evidence synced/prepared</span><strong>{handoff.prepared_evidence_count}</strong></div>
+                <div><span>Draft status</span><strong>{handoff.razorpay_draft_status === "prepared" ? "Prepared" : "Not prepared"}</strong></div>
+              </div>
+              {handoff.contest_summary && <p className="contest-summary"><strong>Contest summary:</strong> {handoff.contest_summary}</p>}
+              {handoff.evidence.length ? (
+                <div className="handoff-evidence-table" role="table">
+                  {handoff.evidence.map((item) => (
+                    <div className="handoff-evidence-row" role="row" key={item.evidence_id}>
+                      <div><strong>{item.evidence_category}</strong><small>{item.original_filename}</small></div>
+                      <div><span>Razorpay field</span><strong>{item.razorpay_bucket}</strong></div>
+                      <div><span>Status</span><strong>{item.preparation_status}</strong></div>
+                      <div><span>Document reference</span><strong>{item.razorpay_document_id || item.demo_document_reference || "Not assigned"}</strong></div>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="empty-state">No verified evidence files are currently available for handoff.</p>}
+            </section>
+          )}
+
+          <div className="workflow-actions page-actions">
+            <button className="secondary" type="button" onClick={() => navigateTo("rebuttal")}>Back to Rebuttal</button>
+          </div>
+        </>
+      )}
+
+      {preview && (
+        <div className="preview-backdrop" role="presentation" onMouseDown={() => setPreview(null)}>
+          <section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${preview.filename}`} onMouseDown={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <p className="eyebrow">Evidence preview</p>
+                <h2>{preview.filename}</h2>
+              </div>
+              <button className="secondary small" type="button" onClick={() => setPreview(null)}>Close</button>
+            </header>
+            {preview.contentType === "application/pdf" ? (
+              <iframe className="pdf-preview" src={preview.url} title={`Preview of ${preview.filename}`} />
+            ) : (
+              <img className="image-preview" src={preview.url} alt={`Preview of ${preview.filename}`} />
+            )}
+          </section>
+        </div>
       )}
     </main>
   );

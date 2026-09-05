@@ -1,12 +1,15 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 import evidence_store
 import main
+import razorpay_handoff
 
 
 class EvidenceManagementApiTests(unittest.TestCase):
@@ -76,6 +79,15 @@ class EvidenceManagementApiTests(unittest.TestCase):
             },
         )
 
+    def upload_and_verify(self, dispute_id, category="UPI transaction details"):
+        upload = self.upload_pdf(dispute_id, category)
+        self.assertEqual(upload.status_code, 201, upload.text)
+        verify = self.client.post(
+            f"/evidence/{dispute_id}/{upload.json()['evidence']['evidence_id']}/verify"
+        )
+        self.assertEqual(verify.status_code, 200, verify.text)
+        return upload.json()["evidence"]
+
     def test_existing_models_endpoint(self):
         response = self.client.get("/models")
         self.assertEqual(response.status_code, 200)
@@ -134,6 +146,46 @@ class EvidenceManagementApiTests(unittest.TestCase):
         self.assertEqual(payload["evidence"]["status"], "Pending Review")
         self.assertEqual(payload["recommendation"]["evidence_available"], [])
         self.assertEqual(payload["recommendation"]["evidence_coverage"], 0.0)
+
+        # The refresh endpoint is what the frontend uses after upload. It
+        # must return the newly persisted Pending Review record immediately.
+        refreshed = self.client.get(f"/evidence/{workflow['dispute_id']}")
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        self.assertEqual(len(refreshed.json()["evidence"]), 1)
+        self.assertEqual(
+            refreshed.json()["evidence"][0]["status"],
+            "Pending Review",
+        )
+        self.assertEqual(refreshed.json()["recommendation"]["evidence_coverage"], 0.0)
+
+    def test_preview_serves_registered_file_without_changing_status(self):
+        workflow = self.create_workflow()
+        upload = self.upload_pdf(workflow["dispute_id"])
+        evidence_id = upload.json()["evidence"]["evidence_id"]
+
+        preview = self.client.get(
+            f"/evidence/{workflow['dispute_id']}/{evidence_id}/preview"
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertTrue(preview.headers["content-type"].startswith("application/pdf"))
+        self.assertEqual(preview.content, b"%PDF-1.4\nmerchant evidence")
+        self.assertIn("inline", preview.headers["content-disposition"])
+
+        refreshed = self.client.get(f"/evidence/{workflow['dispute_id']}")
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertEqual(refreshed.json()["evidence"][0]["status"], "Pending Review")
+        self.assertEqual(refreshed.json()["recommendation"]["evidence_coverage"], 0.0)
+
+    def test_preview_rejects_evidence_owned_by_another_dispute(self):
+        first_workflow = self.create_workflow()
+        second_workflow = self.create_workflow()
+        upload = self.upload_pdf(first_workflow["dispute_id"])
+        evidence_id = upload.json()["evidence"]["evidence_id"]
+
+        response = self.client.get(
+            f"/evidence/{second_workflow['dispute_id']}/{evidence_id}/preview"
+        )
+        self.assertEqual(response.status_code, 404)
 
     def test_invalid_file_type_is_rejected(self):
         workflow = self.create_workflow()
@@ -302,3 +354,276 @@ class EvidenceManagementApiTests(unittest.TestCase):
             captured["data"].verified_evidence_metadata[0].original_filename,
             "merchant-record.pdf",
         )
+
+    def test_gemini_prompt_forbids_unsupported_policy_claims(self):
+        captured = {}
+
+        def fake_generation(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(text="Safe draft")
+
+        input_data = main.RebuttalInput(
+            dispute_type="upi_unauthorized",
+            order_value=3137.73,
+            days_since_transaction=4,
+            base_decision="Fight",
+            fight_score=0.82,
+            final_recommendation="Review / Collect Evidence",
+            recommendation_reason="Critical evidence is missing.",
+            evidence_available=[],
+            evidence_missing=["UPI transaction details"],
+        )
+
+        with patch.object(
+            main.client.models,
+            "generate_content",
+            side_effect=fake_generation,
+        ):
+            self.assertEqual(main.generate_rebuttal(input_data), "Safe draft")
+
+        self.assertIn(
+            "Do not cite UPI guidelines, payment-network rules, merchant",
+            captured["contents"],
+        )
+        self.assertIn(
+            "The model result, Fight Score, final recommendation, evidence engine",
+            captured["contents"],
+        )
+        self.assertIn("Use EXACTLY this structure and no other sections", captured["contents"])
+
+    def test_internal_decision_language_is_not_returned_in_draft(self):
+        for draft_with_internal_language in (
+            "Recommendation:\nFight Score: 82%\nThe evidence engine recommends Fight.",
+            "Subject: Case response\nRebuttal: Review / Collect Evidence before responding.",
+            "Subject: Case response\nRebuttal: The model recommends contesting this case.",
+        ):
+            with self.subTest(draft=draft_with_internal_language):
+                draft = main.merchant_facing_draft_or_fallback(
+                    draft_with_internal_language
+                )
+                self.assertNotIn("Fight", draft)
+                self.assertNotIn("evidence engine", draft.lower())
+                self.assertNotIn("Review / Collect Evidence", draft)
+                self.assertNotIn("model", draft.lower())
+
+    def test_demo_handoff_prepares_only_verified_evidence_without_provider_call(self):
+        workflow = self.create_workflow()
+        verified = self.upload_and_verify(workflow["dispute_id"])
+        pending = self.upload_pdf(
+            workflow["dispute_id"], "UPI authentication/authorization records"
+        )
+        self.assertEqual(pending.status_code, 201)
+
+        with patch.dict(os.environ, {"RAZORPAY_MODE": "demo"}, clear=False), patch.object(
+            main, "RazorpayClient"
+        ) as provider_client:
+            response = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/prepare-draft"
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        provider_client.assert_not_called()
+        handoff = response.json()
+        self.assertEqual(handoff["razorpay_mode"], "demo")
+        self.assertEqual(handoff["handoff_status"], "prepared_demo")
+        self.assertEqual(handoff["submission_status"], "not_submitted")
+        self.assertTrue(handoff["demo_dispute_reference"].startswith("demo_disp_"))
+        self.assertLessEqual(len(handoff["contest_summary"]), 1000)
+        self.assertEqual(handoff["verified_evidence_count"], 1)
+        self.assertEqual(len(handoff["evidence"]), 1)
+        self.assertEqual(handoff["evidence"][0]["evidence_id"], verified["evidence_id"])
+        self.assertEqual(handoff["evidence"][0]["razorpay_bucket"], "others")
+        self.assertTrue(
+            handoff["evidence"][0]["demo_document_reference"].startswith("demo_doc_")
+        )
+        self.assertEqual(handoff["evidence"][0]["razorpay_sync_status"], "not_synced")
+
+    def test_connected_handoff_requires_credentials_and_imported_dispute(self):
+        workflow = self.create_workflow()
+        with patch.dict(
+            os.environ,
+            {
+                "RAZORPAY_MODE": "connected",
+                "RAZORPAY_KEY_ID": "",
+                "RAZORPAY_KEY_SECRET": "",
+            },
+            clear=False,
+        ):
+            missing_credentials = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/prepare-draft"
+            )
+        self.assertEqual(missing_credentials.status_code, 503)
+        self.assertIn("backend credentials", missing_credentials.json()["detail"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "RAZORPAY_MODE": "connected",
+                "RAZORPAY_KEY_ID": "key_test",
+                "RAZORPAY_KEY_SECRET": "secret_test",
+            },
+            clear=False,
+        ):
+            missing_dispute = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/prepare-draft"
+            )
+        self.assertEqual(missing_dispute.status_code, 400)
+        self.assertIn("dispute ID", missing_dispute.json()["detail"])
+
+    def test_connected_failure_never_reports_a_prepared_draft(self):
+        workflow = self.create_workflow()
+        self.upload_and_verify(workflow["dispute_id"])
+        evidence_store.update_razorpay_handoff(
+            workflow["dispute_id"], {"razorpay_dispute_id": "disp_AbCdEf12345678"}
+        )
+
+        fake_provider = SimpleNamespace(
+            upload_document=lambda *_: (_ for _ in ()).throw(
+                razorpay_handoff.RazorpayAdapterError("Razorpay could not be reached right now.")
+            )
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "RAZORPAY_MODE": "connected",
+                "RAZORPAY_KEY_ID": "key_test",
+                "RAZORPAY_KEY_SECRET": "secret_test",
+            },
+            clear=False,
+        ), patch.object(main, "RazorpayClient", return_value=fake_provider):
+            response = self.client.post(
+                f"/razorpay/{workflow['dispute_id']}/prepare-draft"
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("prepared", response.json()["detail"].lower())
+        with patch.dict(os.environ, {"RAZORPAY_MODE": "connected"}, clear=False):
+            handoff = self.client.get(
+                f"/razorpay/{workflow['dispute_id']}/handoff"
+            ).json()
+        self.assertEqual(handoff["handoff_status"], "failed")
+        self.assertEqual(handoff["razorpay_draft_status"], "not_prepared")
+        evidence = self.client.get(f"/evidence/{workflow['dispute_id']}").json()["evidence"]
+        self.assertEqual(evidence[0]["razorpay_sync_status"], "failed")
+
+    def test_connected_sync_uses_verified_files_once_and_only_drafts(self):
+        workflow = self.create_workflow()
+        verified = self.upload_and_verify(workflow["dispute_id"])
+        self.upload_pdf(workflow["dispute_id"], "UPI authentication/authorization records")
+        evidence_store.update_razorpay_handoff(
+            workflow["dispute_id"], {"razorpay_dispute_id": "disp_AbCdEf12345678"}
+        )
+
+        class FakeProvider:
+            def __init__(self):
+                self.uploads = []
+                self.drafts = []
+
+            def upload_document(self, _path, filename, _content_type):
+                self.uploads.append(filename)
+                return "doc_TestEvidence123"
+
+            def prepare_draft(self, dispute_id, summary, mapped_documents):
+                self.drafts.append((dispute_id, summary, mapped_documents))
+                return {"id": dispute_id, "status": "open"}
+
+        fake_provider = FakeProvider()
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient", return_value=fake_provider
+        ):
+            first = self.client.post(f"/razorpay/{workflow['dispute_id']}/prepare-draft")
+            second = self.client.post(f"/razorpay/{workflow['dispute_id']}/prepare-draft")
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(fake_provider.uploads, ["merchant-record.pdf"])
+        self.assertEqual(len(fake_provider.drafts), 2)
+        self.assertEqual(fake_provider.drafts[0][2][0]["razorpay_document_id"], "doc_TestEvidence123")
+        self.assertEqual(first.json()["evidence"][0]["evidence_id"], verified["evidence_id"])
+        self.assertEqual(first.json()["evidence"][0]["razorpay_sync_status"], "synced")
+
+        payload = razorpay_handoff.build_contest_payload(
+            "A concise summary.",
+            [
+                {
+                    "razorpay_bucket": "billing_proof",
+                    "razorpay_other_type": None,
+                    "razorpay_document_id": "doc_TestEvidence123",
+                }
+            ],
+        )
+        self.assertEqual(payload["action"], "draft")
+        self.assertNotIn("submit", str(payload).lower())
+        self.assertNotIn("accept", str(payload).lower())
+
+    def test_connected_fetch_rejects_invalid_ids_and_provider_errors_safely(self):
+        workflow = self.create_workflow()
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            invalid = self.client.post(
+                "/razorpay/dispute/fetch",
+                json={"workflow_id": workflow["dispute_id"], "razorpay_dispute_id": "bad"},
+            )
+        self.assertEqual(invalid.status_code, 422)
+
+        fake_provider = SimpleNamespace(
+            fetch_dispute=lambda *_: (_ for _ in ()).throw(
+                razorpay_handoff.RazorpayAdapterError("provider failure")
+            )
+        )
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient", return_value=fake_provider
+        ):
+            failed = self.client.post(
+                "/razorpay/dispute/fetch",
+                json={
+                    "workflow_id": workflow["dispute_id"],
+                    "razorpay_dispute_id": "disp_AbCdEf12345678",
+                },
+            )
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("key_test", failed.json()["detail"])
+
+    def test_connected_fetch_stores_limited_provider_metadata(self):
+        workflow = self.create_workflow()
+        environment = {
+            "RAZORPAY_MODE": "connected",
+            "RAZORPAY_KEY_ID": "key_test",
+            "RAZORPAY_KEY_SECRET": "secret_test",
+        }
+        fake_provider = SimpleNamespace(
+            fetch_dispute=lambda *_: {
+                "id": "disp_AbCdEf12345678",
+                "payment_id": "pay_Example123",
+                "amount": 313773,
+                "currency": "INR",
+                "status": "open",
+                "evidence": {"not": "stored"},
+                "private_provider_field": "not stored",
+            }
+        )
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            main, "RazorpayClient", return_value=fake_provider
+        ):
+            response = self.client.post(
+                "/razorpay/dispute/fetch",
+                json={
+                    "workflow_id": workflow["dispute_id"],
+                    "razorpay_dispute_id": "disp_AbCdEf12345678",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        metadata = response.json()["razorpay_dispute_metadata"]
+        self.assertEqual(metadata["id"], "disp_AbCdEf12345678")
+        self.assertNotIn("evidence", metadata)
+        self.assertNotIn("private_provider_field", metadata)
